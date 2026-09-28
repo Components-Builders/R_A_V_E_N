@@ -1,6 +1,8 @@
 """raven/config.py — settings.json loading/saving."""
 import json
 
+import pytest
+
 from raven import config
 
 
@@ -35,6 +37,41 @@ def test_save_creates_parent_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SETTINGS_PATH", nested)
     config.save_settings({"model": {"name": "x", "fallbacks": []}})
     assert nested.exists()
+
+
+# ---------------------------------------------------------------------------
+# model.provider + get_api_key(provider): multi-provider support (NVIDIA)
+# ---------------------------------------------------------------------------
+
+def test_default_model_provider_is_openrouter(settings_path):
+    assert config.load_settings()["model"]["provider"] == "openrouter"
+
+
+def test_model_provider_override_merges_like_any_other_model_field(settings_path):
+    settings_path.write_text(json.dumps({"model": {"provider": "nvidia", "name": "meta/llama-3.1-8b-instruct"}}))
+    settings = config.load_settings()
+    assert settings["model"]["provider"] == "nvidia"
+    assert settings["model"]["name"] == "meta/llama-3.1-8b-instruct"
+    assert settings["model"]["fallbacks"] == config.DEFAULT_SETTINGS["model"]["fallbacks"]  # untouched
+
+
+def test_get_api_key_reads_the_right_env_var_per_provider(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setenv("NVIDIA_API_KEY", "nv-key")
+    assert config.get_api_key() == "or-key"  # default, unchanged for every pre-existing call site
+    assert config.get_api_key("openrouter") == "or-key"
+    assert config.get_api_key("nvidia") == "nv-key"
+
+
+def test_get_api_key_missing_env_var_raises_a_clear_message(monkeypatch):
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="NVIDIA_API_KEY"):
+        config.get_api_key("nvidia")
+
+
+def test_get_api_key_unknown_provider_raises_a_clear_message():
+    with pytest.raises(RuntimeError, match="Unknown model provider"):
+        config.get_api_key("openai")
 
 
 # ---------------------------------------------------------------------------

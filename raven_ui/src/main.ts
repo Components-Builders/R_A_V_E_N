@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, session } from 'electron';
 import path from 'node:path';
 import started from 'electron-squirrel-startup';
 import { startServer, stopServer } from './serverProcess';
@@ -15,7 +15,7 @@ const createWindow = () => {
     height: 780,
     minWidth: 720,
     minHeight: 520,
-    backgroundColor: '#bcbec3',
+    backgroundColor: '#e3e3e3',
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -41,6 +41,13 @@ const createWindow = () => {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.on('ready', () => {
+  // Push-to-talk (VoiceStage.tsx) calls getUserMedia({audio:true}) from the
+  // renderer. Electron denies permission requests it hasn't been told about,
+  // so without this the mic prompt would never resolve at all -- only our
+  // own window ever asks, so granting 'media' outright is safe here.
+  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+    callback(permission === 'media');
+  });
   void startServer(); // the UI reconnects on its own, so no need to wait for it
   createWindow();
 });

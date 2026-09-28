@@ -15,6 +15,23 @@ from fastapi.testclient import TestClient
 from raven import server
 
 
+@pytest.fixture(autouse=True)
+def _isolate_settings(settings_path):
+    """Found live (2026-09-28): _build_assistant calls the REAL load_settings()
+    in every test here that doesn't explicitly mock it -- meaning any test
+    that assumes OpenRouterProvider gets constructed was silently depending
+    on the real ~/.raven/settings.json NOT saying model.provider: "nvidia".
+    Once something (this project's own live model-switch testing, or a user
+    clicking "Use this model" in the real app) actually set that, those tests
+    started constructing a REAL NvidiaProvider and making a REAL network call
+    with the mocked "fake-key" -- a genuine 401, not the mocked reply. autouse
+    so every test in this file is isolated by default, the same way `store`
+    already isolates ~/.raven/history.db; a test that wants specific settings
+    still patches `load_settings` directly (see the model-config tests) --
+    that patch simply wins over this file staying absent/default."""
+    return settings_path
+
+
 def _configure(MockStore, history=None):
     """A mocked Store that behaves like an empty single-session store."""
     m = MockStore.return_value
@@ -336,3 +353,287 @@ def test_a_new_connection_reopens_the_most_recent_chat(real_store):
         history = ws.receive_json()
     assert history["session"] == s1["current"]
     assert [i["text"] for i in history["items"]] == ["remember me", "ok"]
+
+
+# ---------------------------------------------------------------------------
+# Voice input (push-to-talk from the desktop UI): "transcribe" -> "transcript"
+# / "transcript_error". Runs independently of Store/Assistant, so a minimal
+# connection (no ask/session traffic) is enough -- only raven.server.voice is
+# mocked, never the real faster-whisper/sounddevice stack.
+# ---------------------------------------------------------------------------
+
+def _connect():
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore:
+        _configure(MockStore)
+        client = TestClient(server.app)
+        with client.websocket_connect("/ws") as ws:
+            yield ws
+
+
+def test_transcribe_reports_when_voice_dependencies_are_missing():
+    with patch.object(server.voice, "is_available", return_value=False):
+        for ws in _connect():
+            ws.send_json({"type": "transcribe", "audio": "", "id": "r1"})
+            msg = _recv(ws, "transcript_error")
+    assert msg == {"type": "transcript_error", "id": "r1",
+                   "message": 'Voice dependencies aren\'t installed -- pip install ".[voice]" '
+                              "(and on Linux: sudo apt install libportaudio2)."}
+
+
+def test_transcribe_reports_when_the_model_is_not_downloaded():
+    with patch.object(server.voice, "is_available", return_value=True), \
+         patch.object(server.voice, "model_ready", return_value=False):
+        for ws in _connect():
+            ws.send_json({"type": "transcribe", "audio": "", "id": "r1"})
+            msg = _recv(ws, "transcript_error")
+    assert msg == {"type": "transcript_error", "id": "r1",
+                   "message": "Voice model not downloaded -- run: python -m raven.voice"}
+
+
+def test_transcribe_decodes_16bit_pcm_and_returns_the_transcript():
+    import base64
+    import numpy as np
+    # A tiny, deliberately exact sample -- half and negative-half full scale --
+    # so the int16 -> float32 conversion is checked precisely, not just "some array".
+    pcm = np.array([16384, -16384, 0], dtype="<i2")
+    audio_b64 = base64.b64encode(pcm.tobytes()).decode()
+    seen = {}
+
+    def fake_transcribe(samples, model_name=None):
+        seen["samples"] = samples.copy()
+        return "hello there"
+
+    with patch.object(server.voice, "is_available", return_value=True), \
+         patch.object(server.voice, "model_ready", return_value=True), \
+         patch.object(server.voice, "transcribe", side_effect=fake_transcribe):
+        for ws in _connect():
+            ws.send_json({"type": "transcribe", "audio": audio_b64, "id": "r2"})
+            msg = _recv(ws, "transcript")
+    assert msg == {"type": "transcript", "id": "r2", "text": "hello there"}
+    assert seen["samples"] == pytest.approx([0.5, -0.5, 0.0], abs=1e-3)
+
+
+def test_transcribe_surfaces_a_missing_model_raised_from_transcribe_itself():
+    """model_ready() can race with a concurrent download/deletion -- transcribe()
+    itself raising ModelNotDownloadedError must be caught with the same clear
+    message, not just the pre-flight model_ready() check."""
+    from raven.voice import ModelNotDownloadedError
+    with patch.object(server.voice, "is_available", return_value=True), \
+         patch.object(server.voice, "model_ready", return_value=True), \
+         patch.object(server.voice, "transcribe", side_effect=ModelNotDownloadedError("go download it")):
+        for ws in _connect():
+            ws.send_json({"type": "transcribe", "audio": "", "id": "r3"})
+            msg = _recv(ws, "transcript_error")
+    assert msg == {"type": "transcript_error", "id": "r3", "message": "go download it"}
+
+
+def test_transcribe_reports_an_unexpected_failure_without_crashing_the_connection():
+    with patch.object(server.voice, "is_available", return_value=True), \
+         patch.object(server.voice, "model_ready", return_value=True), \
+         patch.object(server.voice, "transcribe", side_effect=RuntimeError("boom")):
+        for ws in _connect():
+            ws.send_json({"type": "transcribe", "audio": "", "id": "r4"})
+            msg = _recv(ws, "transcript_error")
+    assert msg["type"] == "transcript_error" and "boom" in msg["message"]
+
+
+def test_transcribe_can_run_while_an_ask_is_in_flight():
+    """Unlike new_session/open_session/delete_session, transcribe must NOT be
+    blocked by the 'a request is already running' guard -- it never touches
+    self.assistant or self.store."""
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider") as MockProvider, \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server.voice, "is_available", return_value=True), \
+         patch.object(server.voice, "model_ready", return_value=True), \
+         patch.object(server.voice, "transcribe", return_value="a said thing"):
+        _configure(MockStore)
+        MockProvider.return_value.reply.return_value = {"role": "assistant", "content": "ok"}
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "ask", "text": "slow request"})
+            ws.send_json({"type": "transcribe", "audio": "", "id": "r5"})
+            # ask() also triggers "sessions"/"stats" follow-ups, and the background
+            # statusline push (Session.start_stats_loop) can interleave further
+            # unrelated messages at any point on a live connection -- read
+            # generously until both operations are seen, not a fixed count.
+            wanted = {"reply", "transcript"}
+            kinds = set()
+            for _ in range(20):
+                kinds.add(ws.receive_json()["type"])
+                if wanted <= kinds:
+                    break
+    assert wanted <= kinds
+
+
+
+# ---------------------------------------------------------------------------
+# Model provider/name (desktop Settings panel): get_model_config, list_models,
+# set_model. load_settings/save_settings are patched wherever a test needs
+# control over -- or must never touch -- the real settings.json. Connections
+# are opened directly (not via the transcribe tests' _connect() helper, whose
+# own internal patches would shadow a test's own). Replies are drained with
+# _recv(..., msg_type) rather than assumed to be the very next message,
+# because the background statusline push (Session.start_stats_loop) can
+# interleave a "stats" message at any point on a live connection.
+# ---------------------------------------------------------------------------
+
+def _default_model_settings():
+    return {
+        "model": {"provider": "openrouter", "name": "openrouter/free", "fallbacks": ["a", "b"], "vision": "v"},
+        "statusline": {"segments": ["memory"]},  # cheap, provider-independent -- see module docstring above
+    }
+
+
+def _recv(ws, msg_type, max_tries=8):
+    """Read messages until one of type `msg_type` arrives (skipping any
+    interleaved background "stats" pushes), or fail after max_tries."""
+    for _ in range(max_tries):
+        msg = ws.receive_json()
+        if msg["type"] == msg_type:
+            return msg
+    raise AssertionError(f"no {msg_type!r} message received in {max_tries} tries")
+
+
+def test_get_model_config_reports_the_current_provider_and_name():
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "load_settings", return_value=_default_model_settings()):
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "get_model_config"})
+            msg = _recv(ws, "model_config")
+    assert msg == {"type": "model_config", "provider": "openrouter", "name": "openrouter/free"}
+
+
+def test_list_models_returns_the_nvidia_catalog():
+    with patch.object(server, "get_api_key", return_value="fake-key") as mock_get_key, \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "list_nvidia_models", return_value=["meta/llama-3.1-8b-instruct", "google/gemma-2-9b"]) as mock_list:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "list_models", "provider": "nvidia"})
+            msg = _recv(ws, "models")
+    mock_get_key.assert_any_call("nvidia")
+    mock_list.assert_called_once_with("fake-key")
+    assert msg == {"type": "models", "provider": "nvidia", "items": ["meta/llama-3.1-8b-instruct", "google/gemma-2-9b"]}
+
+
+def test_list_models_reports_a_failure_without_crashing_the_connection():
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "list_nvidia_models", side_effect=RuntimeError("NVIDIA 401: bad key")):
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "list_models", "provider": "nvidia"})
+            msg = _recv(ws, "models_error")
+    assert msg == {"type": "models_error", "provider": "nvidia", "message": "NVIDIA 401: bad key"}
+
+
+def test_list_models_for_an_unsupported_provider_is_a_clear_error_not_a_network_call():
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "list_nvidia_models") as mock_list:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "list_models", "provider": "openrouter"})
+            msg = _recv(ws, "models_error")
+    mock_list.assert_not_called()
+    assert msg["provider"] == "openrouter"
+
+
+def test_set_model_switches_provider_persists_and_takes_effect_immediately():
+    settings = _default_model_settings()
+    with patch.object(server, "get_api_key", return_value="nv-key") as mock_get_key, \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "NvidiaProvider") as MockNvidia, \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "load_settings", return_value=settings), \
+         patch.object(server, "save_settings") as mock_save:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "set_model", "provider": "nvidia", "name": "meta/llama-3.1-8b-instruct"})
+            config_msg = _recv(ws, "model_config")
+
+    mock_get_key.assert_any_call("nvidia")
+    # switching PROVIDER (openrouter -> nvidia) must drop the old provider's fallbacks
+    MockNvidia.assert_called_once_with(api_key="nv-key", model="meta/llama-3.1-8b-instruct", fallbacks=[])
+    saved = mock_save.call_args[0][0]
+    assert saved["model"]["provider"] == "nvidia"
+    assert saved["model"]["name"] == "meta/llama-3.1-8b-instruct"
+    assert saved["model"]["fallbacks"] == []
+    assert saved["model"]["vision"] == "v"  # untouched
+    assert config_msg == {"type": "model_config", "provider": "nvidia", "name": "meta/llama-3.1-8b-instruct"}
+
+
+def test_set_model_same_provider_different_model_keeps_fallbacks():
+    settings = _default_model_settings()
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider") as MockOpenRouter, \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "load_settings", return_value=settings), \
+         patch.object(server, "save_settings") as mock_save:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "set_model", "provider": "openrouter", "name": "some/other-model:free"})
+            _recv(ws, "model_config")
+
+    saved = mock_save.call_args[0][0]
+    assert saved["model"]["fallbacks"] == ["a", "b"]
+    # the LAST call is the live switch, made with the SAME (unchanged) fallbacks
+    assert MockOpenRouter.call_args.kwargs["fallbacks"] == ["a", "b"]
+
+
+def test_set_model_rejects_an_unknown_provider_without_touching_settings():
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "save_settings") as mock_save:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "set_model", "provider": "openai", "name": "gpt-4"})
+            msg = _recv(ws, "error")
+    assert "Unknown model provider" in msg["message"]
+    mock_save.assert_not_called()
+
+
+def test_set_model_rejects_an_empty_name():
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "save_settings") as mock_save:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "set_model", "provider": "nvidia", "name": "  "})
+            msg = _recv(ws, "error")
+    assert "model name is required" in msg["message"]
+    mock_save.assert_not_called()
+
+
+def test_set_model_a_bad_api_key_leaves_the_current_model_untouched():
+    """Validated by actually constructing the new provider BEFORE persisting
+    or swapping self.assistant.provider -- a missing/bad key must not silently
+    strand the session on a broken model or corrupt settings.json."""
+    settings = _default_model_settings()
+
+    def flaky_get_key(provider):
+        if provider == "nvidia":
+            raise RuntimeError("Set NVIDIA_API_KEY in your environment or .env file")
+        return "fake-key"
+
+    with patch.object(server, "get_api_key", side_effect=flaky_get_key), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "load_settings", return_value=settings), \
+         patch.object(server, "save_settings") as mock_save:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "set_model", "provider": "nvidia", "name": "meta/llama-3.1-8b-instruct"})
+            msg = _recv(ws, "error")
+    assert "NVIDIA_API_KEY" in msg["message"]
+    mock_save.assert_not_called()

@@ -246,6 +246,15 @@ class OpenRouterProvider(LLMProvider):
         # explicit string (including plain SYSTEM_PROMPT) to skip that lookup
         # — mainly for tests, so they're not coupled to the filesystem/cwd.
         self.system_prompt = system_prompt if system_prompt is not None else build_system_prompt()
+        # A plain requests.post() call opens a fresh TCP+TLS connection every
+        # time (it builds and tears down its own throwaway Session internally)
+        # -- measured live against OpenRouter: ~1-2.6s cold per call, no
+        # improvement across repeated calls. A Session kept alive for this
+        # provider's whole lifetime reuses the connection instead (HTTP
+        # keep-alive), measured at ~300ms after the first call -- a real win
+        # since one conversation turn often makes several sequential calls
+        # (each tool-call round trip is its own reply()).
+        self._session = requests.Session()
 
     def reply(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
         payload = {
@@ -285,7 +294,7 @@ class OpenRouterProvider(LLMProvider):
         """Shared by reply() and reply_with_image() -- the actual HTTP call,
         error handling, and token/model bookkeeping, so the two don't drift
         out of sync on retry/timeout/error behavior."""
-        response = requests.post(
+        response = self._session.post(
             url="https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -302,3 +311,135 @@ class OpenRouterProvider(LLMProvider):
         self.total_tokens += data.get("usage", {}).get("total_tokens", 0)
         self.last_model = data.get("model", self.model)
         return data["choices"][0]["message"]
+
+
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+
+
+class NvidiaProvider(LLMProvider):
+    """Uses NVIDIA's free-tier NIM API (build.nvidia.com) -- an ordinary
+    OpenAI-compatible chat-completions endpoint. Get a free key at
+    build.nvidia.com (any listed model card's "Get API Key").
+
+    Unlike OpenRouter, this endpoint has no built-in "try these models in
+    order" request field -- fallbacks are tried client-side, one HTTP call
+    per candidate, stopping at the first that succeeds."""
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        fallbacks: list[str] | None = None,
+        system_prompt: str | None = None,
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.fallbacks = fallbacks or []
+        self.total_tokens = 0
+        self.last_model = model
+        self.system_prompt = system_prompt if system_prompt is not None else build_system_prompt()
+        # See OpenRouterProvider's own _session for why: a plain requests.post()
+        # opens a fresh connection every call (~800ms cold, measured live against
+        # NVIDIA's API); a Session reused for this provider's lifetime keeps the
+        # connection alive instead (~300ms after the first call) -- a real win
+        # across a conversation's several sequential tool-call round trips, and
+        # especially here, where a fallback means TWO calls back-to-back.
+        self._session = requests.Session()
+
+    def reply(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+        base_payload = {"messages": [{"role": "system", "content": self.system_prompt}, *messages]}
+        if tools:
+            base_payload["tools"] = tools
+        return self._post_with_fallback(base_payload)
+
+    def reply_with_image(self, text: str, image_b64: str, mime_type: str, model: str) -> str:
+        """Same shape as OpenRouterProvider's own -- a single-shot multimodal
+        call with an OpenAI-style image_url content part, which NVIDIA's
+        vision-capable NIM models (e.g. a Llama 3.2 Vision card) also accept."""
+        payload = {
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
+                ],
+            }],
+        }
+        message = self._post(payload)
+        return message.get("content") or ""
+
+    def _post_with_fallback(self, base_payload: dict) -> dict:
+        """Try self.model, then each fallback in order, stopping at the first
+        that succeeds. Mirrors OpenRouterProvider's "models" list behavior,
+        just implemented as sequential requests since this API has no
+        equivalent single-request field for it."""
+        last_error: Exception | None = None
+        for candidate in [self.model, *self.fallbacks]:
+            try:
+                return self._post({"model": candidate, **base_payload})
+            except Exception as e:  # noqa: BLE001 -- try the next candidate regardless of failure kind
+                last_error = e
+        raise last_error if last_error else RuntimeError("No model candidates configured.")
+
+    def _post(self, payload: dict) -> dict:
+        response = self._session.post(
+            url=f"{NVIDIA_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json=payload,
+            timeout=60,  # same "requests has no default timeout" guard as OpenRouterProvider._post
+        )
+        if not response.ok:
+            # Found live (2026-09-28): /v1/models (list_nvidia_models) lists NVIDIA's
+            # whole catalog, but a listed model isn't necessarily INVOKABLE with a
+            # given key -- most of the catalog 404s here with this exact "Function
+            # ...: Not found for account" wording, seemingly needing separate
+            # per-model enablement on build.nvidia.com, not just any valid key.
+            # Translate that specific case into an actionable message instead of
+            # leaving the user to decode NVIDIA's internal function-id wording.
+            if response.status_code == 404 and "not found for account" in response.text.lower():
+                raise RuntimeError(
+                    f"NVIDIA 404: {payload['model']!r} isn't enabled for this API key's account "
+                    f"(NVIDIA's catalog can list a model that your account can't actually call). "
+                    f"Open the model's page on build.nvidia.com and try it there first -- if it "
+                    f"works there, that confirms it's enabled for your account; if not, pick a "
+                    f"different model."
+                )
+            raise RuntimeError(f"NVIDIA {response.status_code}: {response.text}")
+        data = response.json()
+        self.total_tokens += data.get("usage", {}).get("total_tokens", 0)
+        self.last_model = data.get("model", payload["model"])
+        return data["choices"][0]["message"]
+
+
+def list_nvidia_models(api_key: str) -> list[str]:
+    """The model ids this NVIDIA API key can use, sorted -- for populating the
+    desktop UI's provider/model picker (SettingsPanel.tsx -> server.py's
+    `list_models` message). A plain GET against the same OpenAI-compatible
+    surface `/v1/models` exposes on virtually every such API. Raises
+    RuntimeError with a clear message on any failure -- a bad/expired key, no
+    network, or an unexpected response shape -- never returns a partial or
+    silently-empty list that would just look like "no models available"."""
+    try:
+        response = requests.get(
+            url=f"{NVIDIA_BASE_URL}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(f"Couldn't reach NVIDIA's API: {e}") from e
+    if not response.ok:
+        raise RuntimeError(f"NVIDIA {response.status_code}: {response.text}")
+    try:
+        data = response.json()
+        ids = [item["id"] for item in data["data"]]
+    except (ValueError, KeyError, TypeError) as e:
+        raise RuntimeError(f"Unexpected response listing NVIDIA models: {e}") from e
+    return sorted(ids)
+
+
+# Known provider names (settings.json's model.provider) -- used by server.py
+# to validate an incoming set_model/list_models request before touching
+# anything, and here as the single list of "what providers exist" rather
+# than repeating the two names in several places.
+KNOWN_PROVIDERS = ("openrouter", "nvidia")

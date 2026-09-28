@@ -18,7 +18,17 @@ type ServerMessage =
   | { type: 'reply'; text: string }
   | { type: 'tool_call'; name: string; args: Record<string, unknown> }
   | { type: 'confirm_request'; id: string; prompt: string }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string }
+  | { type: 'stats'; segments: { name: string; text: string }[] }
+  | { type: 'transcript'; id: string; text: string }
+  | { type: 'transcript_error'; id: string; message: string }
+  | { type: 'model_config'; provider: string; name: string }
+  | { type: 'models'; provider: string; items: string[] }
+  | { type: 'models_error'; provider: string; message: string };
+
+export type StatSegment = { name: string; text: string };
+export type ModelConfig = { provider: string; name: string };
+
 
 const SERVER_URL = 'ws://127.0.0.1:8756/ws';
 const RECONNECT_MIN_MS = 1000;
@@ -57,14 +67,23 @@ export function useRaven() {
   const [busy, setBusy] = useState(false); // an ask is in flight
   const [statusText, setStatusText] = useState<string | null>(null);
   const [toolStatus, setToolStatus] = useState<string | null>(null);
+  const [stats, setStats] = useState<StatSegment[]>([]);
 
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [currentSession, setCurrentSession] = useState<number | null>(null);
   const [toolLog, setToolLog] = useState<ToolEvent[]>([]); // tool calls of the current/last turn
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [modelConfig, setModelConfig] = useState<ModelConfig | null>(null);
+  const [modelsByProvider, setModelsByProvider] = useState<Record<string, string[]>>({});
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const toolId = useRef(0);
+  // Pending push-to-talk transcriptions: id -> the promise's resolve/reject,
+  // so requestTranscribe() can be awaited from VoiceStage even though the
+  // answer arrives later as an ordinary, id-tagged websocket message.
+  const pendingTranscriptions = useRef(new Map<string, { resolve: (text: string) => void; reject: (err: Error) => void }>());
 
   // for randomly switching between thinking words
   useEffect(() => {
@@ -103,8 +122,13 @@ export function useRaven() {
         setConnected(false);
         // Whatever was in flight can never complete on a dead socket -- don't leave the UI "thinking" forever.
         setBusy(false);
-        setToolStatus(null); 
+        setToolStatus(null);
         setPendingConfirm(null);
+        setStats([]);
+        // A dead socket can never deliver these -- fail every push-to-talk
+        // still awaiting a transcript instead of leaving it hanging forever.
+        pendingTranscriptions.current.forEach(({ reject }) => reject(new Error('Connection lost while transcribing.')));
+        pendingTranscriptions.current.clear();
         if (disposed) return;
         retryTimer = setTimeout(connect, delay);
         delay = Math.min(delay * 2, RECONNECT_MAX_MS);
@@ -135,21 +159,48 @@ export function useRaven() {
             break;
           case 'reply':
             setBusy(false);
-            setToolStatus(null); 
+            setToolStatus(null);
             setMessages((m) => [...m, { role: 'raven', text: data.text }]);
             break;
           case 'tool_call': {
             const label = toolStatusText(data.name, data.args);
-            setToolStatus(label); 
+            setToolStatus(label);
             setToolLog((log) => [...log, { id: ++toolId.current, label }]);
             break;
           }
+          case 'stats':
+            setStats(data.segments);
+            break;
+          case 'transcript': {
+            const pending = pendingTranscriptions.current.get(data.id);
+            pendingTranscriptions.current.delete(data.id);
+            pending?.resolve(data.text);
+            break;
+          }
+          case 'transcript_error': {
+            const pending = pendingTranscriptions.current.get(data.id);
+            pendingTranscriptions.current.delete(data.id);
+            pending?.reject(new Error(data.message));
+            break;
+          }
+          case 'model_config':
+            setModelConfig({ provider: data.provider, name: data.name });
+            break;
+          case 'models':
+            setModelsLoading(false);
+            setModelsError(null);
+            setModelsByProvider((m) => ({ ...m, [data.provider]: data.items }));
+            break;
+          case 'models_error':
+            setModelsLoading(false);
+            setModelsError(data.message);
+            break;
           case 'confirm_request':
             setPendingConfirm({ id: data.id, prompt: data.prompt });
             break;
           case 'error':
             setBusy(false);
-            setToolStatus(null); 
+            setToolStatus(null);
             setError(data.message);
             break;
         }
@@ -192,6 +243,26 @@ export function useRaven() {
 
   const dismissError = useCallback(() => setError(null), []);
 
+  /**
+   * Send captured audio (16-bit PCM, little-endian, mono, base64-encoded --
+   * see VoiceStage.tsx for the capture side) for transcription and resolve
+   * with the resulting text. Deliberately NOT surfaced through the shared
+   * `error` banner -- a failed push-to-talk (mic denied, model not
+   * downloaded) is VoiceStage's own concern, not something that should
+   * interrupt whatever's shown in the Chat stage.
+   */
+  const requestTranscribe = useCallback((audioBase64: string): Promise<string> => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error('Not connected to R.A.V.E.N.'));
+    }
+    const id = `t${++toolId.current}-${Date.now()}`;
+    return new Promise<string>((resolve, reject) => {
+      pendingTranscriptions.current.set(id, { resolve, reject });
+      ws.send(JSON.stringify({ type: 'transcribe', audio: audioBase64, id }));
+    });
+  }, []);
+
   const sendControl = useCallback((payload: Record<string, unknown>) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -204,9 +275,29 @@ export function useRaven() {
   const openSession = useCallback((id: number) => sendControl({ type: 'open_session', id }), [sendControl]);
   const deleteSession = useCallback((id: number) => sendControl({ type: 'delete_session', id }), [sendControl]);
 
+  // Model provider/name (SettingsPanel.tsx): current config, the NVIDIA
+  // catalog for a given API key, and switching. Plain request/state (not a
+  // promise, unlike requestTranscribe) -- Settings is a view, not something
+  // driven imperatively from a single call site.
+  const getModelConfig = useCallback(() => sendControl({ type: 'get_model_config' }), [sendControl]);
+  const listModels = useCallback(
+    (provider: string) => {
+      setModelsLoading(true);
+      setModelsError(null);
+      sendControl({ type: 'list_models', provider });
+    },
+    [sendControl],
+  );
+  const setModel = useCallback(
+    (provider: string, name: string) => sendControl({ type: 'set_model', provider, name }),
+    [sendControl],
+  );
+
   return {
-    connected, messages, busy, statusText, toolLog, pendingConfirm, error, sessions, currentSession,
-    ask, respondToConfirm, dismissError, newSession, openSession, deleteSession,
+    connected, messages, busy, statusText, toolLog, pendingConfirm, error, sessions, currentSession, stats,
+    modelConfig, modelsByProvider, modelsLoading, modelsError,
+    ask, respondToConfirm, dismissError, newSession, openSession, deleteSession, requestTranscribe,
+    getModelConfig, listModels, setModel,
   };
 }
 

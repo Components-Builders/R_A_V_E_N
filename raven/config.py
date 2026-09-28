@@ -13,6 +13,12 @@ NOTES_PATH = Path.home() / ".raven" / "memory" / "notes.md"  # model-written, cr
 DEFAULT_SETTINGS = {
     # Primary model + fallbacks tried in order when a free model is down/rate-limited.
     "model": {
+        # Which LLMProvider subclass build_provider() constructs (llm_provider.py) --
+        # "openrouter" or "nvidia" (build.nvidia.com's free-tier NIM API). Each
+        # provider reads its own API key from a separate env var -- see
+        # PROVIDER_API_KEY_ENV below -- so switching providers doesn't touch
+        # whichever key isn't in use.
+        "provider": "openrouter",
         "name": "nvidia/nemotron-3.5-lightning:free",
         "fallbacks": ["google/gemma-4-31b-it:free", "openrouter/free"],
         # V2: a SEPARATE model for analyze_image -- the main chat model above
@@ -45,10 +51,28 @@ DEFAULT_SETTINGS = {
 }
 
 
-def get_api_key() -> str:
-    key = os.environ.get("OPENROUTER_API_KEY")
+# Each provider's API key lives in its own env var, so switching model.provider
+# in settings.json never touches a key that isn't currently in use.
+PROVIDER_API_KEY_ENV = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "nvidia": "NVIDIA_API_KEY",
+}
+
+
+def get_api_key(provider: str = "openrouter") -> str:
+    """The API key for `provider` (default "openrouter", so every pre-existing
+    no-arg call site keeps working unchanged). Raises a clear, actionable
+    RuntimeError -- never returns an empty/missing key silently -- for either
+    an unrecognized provider name or a recognized one with no key set."""
+    env_var = PROVIDER_API_KEY_ENV.get(provider)
+    if env_var is None:
+        raise RuntimeError(
+            f"Unknown model provider: {provider!r}. Known providers: "
+            f"{', '.join(sorted(PROVIDER_API_KEY_ENV))}."
+        )
+    key = os.environ.get(env_var)
     if not key:
-        raise RuntimeError("Set OPENROUTER_API_KEY in your environment or .env file")
+        raise RuntimeError(f"Set {env_var} in your environment or .env file")
     return key
 
 

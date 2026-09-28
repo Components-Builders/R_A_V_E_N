@@ -286,6 +286,29 @@ background thread so the UI never blocks. `Ctrl+C` at the prompt clears the
 line; `Ctrl+D` on an empty prompt exits. `Ctrl+V` is voice, not paste — use
 the terminal's paste shortcut (usually `Ctrl+Shift+V`).
 
+### Voice mode in the desktop app (Step 3.62)
+
+A second, independent voice input path (the CLI's `Ctrl+V` is the first):
+the desktop app's "Voice" mode captures audio in the browser (Web Audio API,
+raw PCM, no compressed format/ffmpeg) and sends it to `raven/server.py`'s
+new `transcribe` websocket message, which decodes it and calls the SAME
+offline faster-whisper pipeline (`raven/voice.py`) the CLI already uses --
+one transcription engine, two front ends. Requires the same setup as
+`Ctrl+V` (`pip install ".[voice]"`, the model download).
+
+Hold **Shift** to record, release to stop. Two behaviors, a checkbox toggle
+(persisted in `localStorage`):
+- **Off (default):** the transcript is shown, editable, with Send/Discard --
+  never auto-sent, matching every other voice-input path in this project.
+- **On ("Send automatically on release"):** the transcript is sent straight
+  to the model as soon as it's back, no review step.
+
+Disabled while disconnected or while a request is already running. A very
+fast tap (Shift released before the microphone finishes opening) is handled
+without getting stuck. Server errors (voice deps missing, model not
+downloaded, transcription failure) surface inline in the Voice stage, not as
+the shared chat error banner.
+
 ---
 
 ## Installing and the desktop app (Step 3.58)
@@ -434,18 +457,41 @@ to the prompt text.
 
 ## Model and configuration
 
-- **Provider:** OpenRouter. Requests use a model list, so if the primary is
-  down, rate-limited or paywalled, the next is tried automatically.
-  Defaults: `nvidia/nemotron-3.5-lightning:free`, falling back to
-  `google/gemma-4-31b-it:free`, then `openrouter/free`.
-- **Requests time out after 60 s** and OpenRouter's error text is surfaced, not
-  hidden behind a generic HTTP error.
+- **Provider (Step 3.63):** `model.provider` in `~/.raven/settings.json` picks
+  `OpenRouterProvider` or `NvidiaProvider` (`raven/llm_provider.py`); default
+  is `"openrouter"`. Each reads its own API key from its own env var, so
+  switching one never touches the other's.
+  - **OpenRouter:** one request lists all candidate models
+    (`model.name` + `model.fallbacks`); OpenRouter tries them in order
+    server-side. Defaults: `nvidia/nemotron-3.5-lightning:free`, falling back
+    to `google/gemma-4-31b-it:free`, then `openrouter/free`. Key:
+    `OPENROUTER_API_KEY`.
+  - **NVIDIA (build.nvidia.com's free NIM API):** an ordinary OpenAI-compatible
+    endpoint with a single `model` field, so fallbacks are tried client-side —
+    one HTTP request per candidate, stopping at the first success. Key:
+    `NVIDIA_API_KEY`. `list_nvidia_models()` lists the models a key can use
+    (`GET /v1/models`), which powers the desktop app's model picker
+    (Settings → Model); OpenRouter has no such listing wired up yet, so its
+    model is still typed in directly.
+  - The desktop app can switch provider/model live (Settings panel → the
+    server's `set_model`/`list_models`/`get_model_config` messages): the new
+    provider is constructed and validated *before* anything is persisted or
+    swapped in, so a bad choice (missing key, unknown provider) leaves the
+    current, working model untouched. Switching provider clears
+    `model.fallbacks` — the old list is model ids for the other provider.
+- **Requests time out after 60 s** and the provider's own error text is
+  surfaced, not hidden behind a generic HTTP error.
+- **Connection reuse (Step 3.67):** each provider keeps one persistent
+  `requests.Session()` for its whole lifetime instead of opening a fresh
+  connection per call — measured live at ~60-70% less latency per call after
+  the first, which compounds across a turn's several sequential tool-call
+  round trips (and `NvidiaProvider`'s own back-to-back fallback calls).
 - **Token accounting** comes from the API's `usage` figures.
-- **Settings** (all optional) live in `~/.raven/settings.json`: `model.name`,
-  `model.fallbacks`, `statusline.segments`.
-- **API key:** `OPENROUTER_API_KEY`, from the environment or a `.env` file.
+- **Settings** (all optional) live in `~/.raven/settings.json`: `model.provider`,
+  `model.name`, `model.fallbacks`, `statusline.segments`.
 - **Swappable provider:** implement `LLMProvider.reply()` in
-  `raven/llm_provider.py` and change one line in `cli.py`.
+  `raven/llm_provider.py`; `cli.py`/`server.py` each branch on
+  `model.provider` to pick the class.
 - **Persona:** professional, calm and concise. The system prompt also carries
   what the name stands for (Reasoning Agent for Versatile Execution &
   Negotiation).
@@ -458,7 +504,7 @@ to the prompt text.
 
 | Path | Purpose |
 |---|---|
-| `.env` (project) | `OPENROUTER_API_KEY` |
+| `.env` (project) | `OPENROUTER_API_KEY`, and `NVIDIA_API_KEY` if using that provider |
 | `RAVEN.md` (project) | Optional project-specific rules, loaded into the system prompt |
 | `~/.raven/RAVEN.md` | Optional user-wide rules, loaded into every project's system prompt |
 | `~/.raven/history.db` | Conversation history |

@@ -50,6 +50,7 @@ def _get_service():
     # whole discovery machinery).
     import google_auth_httplib2
     import httplib2
+    from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -60,11 +61,23 @@ def _get_service():
         creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            # First-ever use: opens a browser for the user to log in and
-            # consent. Only happens once — the refresh token then covers
-            # every run after this until it's revoked or expires.
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                # The refresh token itself is dead -- most commonly because the
+                # user revoked R.A.V.E.N's access (Google Account > Security >
+                # Third-party access), but also a token that's simply expired
+                # from disuse. Either way it will NEVER refresh successfully
+                # again, so don't keep failing the same way on every call:
+                # fall through to a fresh consent flow below, same as
+                # first-ever setup (creds=None makes the `if not creds` branch
+                # below run).
+                creds = None
+        if not creds or not creds.valid:
+            # First-ever use, or the token above was just found dead: opens a
+            # browser for the user to log in and consent. The refresh token
+            # this produces then covers every run after this until it's
+            # revoked or expires.
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
             creds = flow.run_local_server(port=0)
         TOKEN_PATH.write_text(creds.to_json())

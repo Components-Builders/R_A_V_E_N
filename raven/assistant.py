@@ -238,6 +238,7 @@ class Assistant:
         self.provider = provider
         self.confirm_run = confirm_run
         self.store = store
+        self.settings = settings or {}
         self.on_tool_call = on_tool_call  # notified (name, args) right before each tool runs
         # C3: user-configured trust, ADDITIVE to SAFE_COMMANDS/SAFE_GIT (never
         # replaces them, and never bypasses the shell-metachar check below).

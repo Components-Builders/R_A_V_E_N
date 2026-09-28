@@ -4,7 +4,7 @@ Path.home()) so this suite can never accidentally pick up a real RAVEN.md."""
 import pytest
 
 from raven import llm_provider
-from raven.llm_provider import OpenRouterProvider, build_system_prompt, load_project_rules
+from raven.llm_provider import NvidiaProvider, OpenRouterProvider, build_system_prompt, list_nvidia_models, load_project_rules
 
 
 def test_no_rules_files_is_silent(tmp_path):
@@ -154,8 +154,11 @@ def test_reply_sends_the_instances_own_system_prompt(monkeypatch):
         captured["payload"] = json
         return FakeResponse()
 
-    monkeypatch.setattr(llm_provider.requests, "post", fake_post)
+    # Patched on the provider's OWN Session instance (not the requests module) --
+    # each provider now keeps one persistent Session for connection reuse, so
+    # that's what actually issues the call. See OpenRouterProvider.__init__.
     provider = OpenRouterProvider(api_key="fake", system_prompt="CUSTOM PROMPT")
+    monkeypatch.setattr(provider._session, "post", fake_post)
     provider.reply([{"role": "user", "content": "hi"}])
     assert captured["payload"]["messages"][0] == {"role": "system", "content": "CUSTOM PROMPT"}
 
@@ -175,7 +178,7 @@ def test_system_prompt_is_mutable_after_construction():
     provider = OpenRouterProvider(api_key="fake", system_prompt="BASE")
     provider.system_prompt += " EXTRA"
     import unittest.mock as mock
-    with mock.patch.object(llm_provider.requests, "post", side_effect=lambda **kw: (captured.update(payload=kw["json"]), FakeResponse())[1]):
+    with mock.patch.object(provider._session, "post", side_effect=lambda **kw: (captured.update(payload=kw["json"]), FakeResponse())[1]):
         provider.reply([{"role": "user", "content": "hi"}])
     assert captured["payload"]["messages"][0]["content"] == "BASE EXTRA"
 
@@ -229,8 +232,8 @@ def test_reply_with_image_builds_the_multimodal_payload_and_uses_the_given_model
         captured["payload"] = json
         return FakeResponse()
 
-    monkeypatch.setattr(llm_provider.requests, "post", fake_post)
     provider = OpenRouterProvider(api_key="fake", model="text-only-model", system_prompt="BASE")
+    monkeypatch.setattr(provider._session, "post", fake_post)
     result = provider.reply_with_image("what is this?", "ZmFrZWJhc2U2NA==", "image/png", "vision-model")
 
     assert result == "a red circle"
@@ -251,8 +254,8 @@ def test_reply_with_image_updates_token_and_model_bookkeeping(monkeypatch):
             return {"choices": [{"message": {"role": "assistant", "content": "x"}}],
                      "usage": {"total_tokens": 42}, "model": "vision-model"}
 
-    monkeypatch.setattr(llm_provider.requests, "post", lambda **kw: FakeResponse())
     provider = OpenRouterProvider(api_key="fake", system_prompt="BASE")
+    monkeypatch.setattr(provider._session, "post", lambda **kw: FakeResponse())
     provider.reply_with_image("q", "aGk=", "image/png", "vision-model")
     assert provider.total_tokens == 42
     assert provider.last_model == "vision-model"
@@ -264,8 +267,8 @@ def test_reply_with_image_propagates_a_failed_call(monkeypatch):
         status_code = 429
         text = "rate limited"
 
-    monkeypatch.setattr(llm_provider.requests, "post", lambda **kw: FakeResponse())
     provider = OpenRouterProvider(api_key="fake", system_prompt="BASE")
+    monkeypatch.setattr(provider._session, "post", lambda **kw: FakeResponse())
     with pytest.raises(RuntimeError, match="429"):
         provider.reply_with_image("q", "aGk=", "image/png", "vision-model")
 
@@ -284,3 +287,160 @@ def test_llm_provider_base_class_declares_reply_with_image_as_a_typed_but_unsupp
     assert hasattr(provider, "reply_with_image")  # inherited from the ABC, always true
     with pytest.raises(NotImplementedError, match="MinimalProvider does not support image analysis"):
         provider.reply_with_image("q", "aGk=", "image/png", "vision-model")
+
+
+# ---------------------------------------------------------------------------
+# NvidiaProvider: an OpenAI-compatible endpoint, single "model" field (no
+# OpenRouter-style multi-model request), client-side fallback instead.
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status_code=200, payload=None, text=""):
+        self.status_code = status_code
+        self.ok = 200 <= status_code < 300
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+def _chat_response(content="hi", model="m1", total_tokens=7):
+    return _FakeResponse(200, {
+        "choices": [{"message": {"role": "assistant", "content": content}}],
+        "usage": {"total_tokens": total_tokens},
+        "model": model,
+    })
+
+
+def test_nvidia_reply_sends_a_single_model_field_not_a_models_list(monkeypatch):
+    captured = {}
+
+    def fake_post(url, headers, json, timeout):
+        captured["url"], captured["headers"], captured["payload"] = url, headers, json
+        return _chat_response()
+
+    provider = NvidiaProvider(api_key="nv-key", model="meta/llama-3.1-8b-instruct", system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", fake_post)
+    provider.reply([{"role": "user", "content": "hi"}])
+
+    assert captured["url"] == "https://integrate.api.nvidia.com/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer nv-key"
+    assert captured["payload"]["model"] == "meta/llama-3.1-8b-instruct"
+    assert "models" not in captured["payload"]  # NOT OpenRouter's multi-model extension
+    assert captured["payload"]["messages"][0] == {"role": "system", "content": "SYS"}
+
+
+def test_nvidia_reply_updates_token_and_model_bookkeeping(monkeypatch):
+    provider = NvidiaProvider(api_key="k", model="meta/llama-3.1-8b-instruct", system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", lambda **kw: _chat_response(model="meta/llama-3.1-8b-instruct", total_tokens=12))
+    provider.reply([{"role": "user", "content": "hi"}])
+    assert provider.total_tokens == 12
+    assert provider.last_model == "meta/llama-3.1-8b-instruct"
+
+
+def test_nvidia_falls_back_to_the_next_model_on_failure(monkeypatch):
+    """Client-side fallback: this endpoint has no single-request "try these
+    models in order" field, so NvidiaProvider must retry with each fallback
+    itself, one HTTP call per candidate, stopping at the first success."""
+    calls = []
+
+    def fake_post(url, headers, json, timeout):
+        calls.append(json["model"])
+        if json["model"] == "primary":
+            return _FakeResponse(503, text="model overloaded")
+        return _chat_response(model=json["model"])
+
+    provider = NvidiaProvider(api_key="k", model="primary", fallbacks=["backup"], system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", fake_post)
+    result = provider.reply([{"role": "user", "content": "hi"}])
+
+    assert calls == ["primary", "backup"]
+    assert result == {"role": "assistant", "content": "hi"}
+    assert provider.last_model == "backup"
+
+
+def test_nvidia_raises_the_last_error_when_every_candidate_fails(monkeypatch):
+    provider = NvidiaProvider(api_key="k", model="primary", fallbacks=["backup"], system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", lambda **kw: _FakeResponse(500, text="boom"))
+    with pytest.raises(RuntimeError, match="500"):
+        provider.reply([{"role": "user", "content": "hi"}])
+
+
+def test_nvidia_translates_the_not_enabled_for_account_404_into_an_actionable_message(monkeypatch):
+    """Found live (2026-09-28): NVIDIA's catalog can list a model that a given
+    key's account isn't actually entitled to call -- surfaced as this exact
+    404 wording, decoded here rather than left as an opaque function UUID."""
+    body = '{"status":404,"title":"Not Found","detail":"Function \'abc-123\': Not found for account \'xyz\'"}'
+    provider = NvidiaProvider(api_key="k", model="some/model", system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", lambda **kw: _FakeResponse(404, text=body))
+    with pytest.raises(RuntimeError, match="isn't enabled for this API key's account"):
+        provider.reply([{"role": "user", "content": "hi"}])
+
+
+def test_nvidia_an_ordinary_404_is_not_mistaken_for_the_not_enabled_case(monkeypatch):
+    provider = NvidiaProvider(api_key="k", model="some/model", system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", lambda **kw: _FakeResponse(404, text="404 page not found"))
+    with pytest.raises(RuntimeError, match="^NVIDIA 404: 404 page not found$"):
+        provider.reply([{"role": "user", "content": "hi"}])
+
+
+def test_nvidia_reply_with_image_uses_the_given_model_not_the_chat_model(monkeypatch):
+    captured = {}
+
+    def fake_post(url, headers, json, timeout):
+        captured["payload"] = json
+        return _chat_response(content="a red circle")
+
+    provider = NvidiaProvider(api_key="k", model="chat-model", system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", fake_post)
+    result = provider.reply_with_image("what is this", "aGk=", "image/png", "vision-model")
+
+    assert result == "a red circle"
+    assert captured["payload"]["model"] == "vision-model"
+    assert captured["payload"]["messages"][0]["content"][1] == {
+        "type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="},
+    }
+    assert "system" not in [m["role"] for m in captured["payload"]["messages"]]
+
+
+def test_nvidia_is_a_real_llm_provider_subclass():
+    provider = NvidiaProvider(api_key="k", model="m", system_prompt="SYS")
+    assert isinstance(provider, llm_provider.LLMProvider)
+
+
+# ---------------------------------------------------------------------------
+# list_nvidia_models: powers the desktop UI's provider/model picker
+# ---------------------------------------------------------------------------
+
+def test_list_nvidia_models_returns_sorted_ids(monkeypatch):
+    def fake_get(url, headers, timeout):
+        assert url == "https://integrate.api.nvidia.com/v1/models"
+        assert headers["Authorization"] == "Bearer nv-key"
+        return _FakeResponse(200, {"data": [{"id": "meta/llama-3.1-70b"}, {"id": "google/gemma-2-9b"}]})
+
+    monkeypatch.setattr(llm_provider.requests, "get", fake_get)
+    assert list_nvidia_models("nv-key") == ["google/gemma-2-9b", "meta/llama-3.1-70b"]
+
+
+def test_list_nvidia_models_reports_a_bad_key_clearly(monkeypatch):
+    monkeypatch.setattr(llm_provider.requests, "get", lambda **kw: _FakeResponse(401, text="Unauthorized"))
+    with pytest.raises(RuntimeError, match="401"):
+        list_nvidia_models("bad-key")
+
+
+def test_list_nvidia_models_reports_a_network_failure_clearly(monkeypatch):
+    import requests as real_requests
+
+    def raise_it(**kw):
+        raise real_requests.ConnectionError("no route to host")
+
+    monkeypatch.setattr(llm_provider.requests, "get", raise_it)
+    with pytest.raises(RuntimeError, match="no route to host"):
+        list_nvidia_models("nv-key")
+
+
+def test_list_nvidia_models_reports_an_unexpected_shape_clearly(monkeypatch):
+    monkeypatch.setattr(llm_provider.requests, "get", lambda **kw: _FakeResponse(200, {"unexpected": "shape"}))
+    with pytest.raises(RuntimeError, match="Unexpected response"):
+        list_nvidia_models("nv-key")

@@ -15,6 +15,17 @@ from raven import tools
 from raven.assistant import Assistant
 
 
+@pytest.fixture(autouse=True)
+def _isolate_settings(settings_path):
+    """build_assistant calls the REAL load_settings() in tests that don't
+    explicitly mock it -- without this, a test asserting OpenRouterProvider
+    gets constructed silently depends on the real ~/.raven/settings.json NOT
+    saying model.provider: "nvidia" (found live: it does, on this machine,
+    from this project's own model-switch testing). Same fix as
+    test_server.py's own `_isolate_settings`."""
+    return settings_path
+
+
 # ---------------------------------------------------------------------------
 # TOOL_STATUS: every registered tool has a status phrase (the class of bug
 # that would silently leave the spinner on "Using <tool>..." for a new tool)
@@ -457,3 +468,25 @@ def test_build_assistant_wires_confirm_run_and_sets_the_assistant_global():
     assert assistant.confirm_run is fake_confirm
     assert cli.ASSISTANT is assistant
     assert provider is MockProvider.return_value
+
+
+def test_build_assistant_uses_nvidia_when_settings_json_says_so(settings_path):
+    """settings.json's model.provider picks the LLMProvider subclass -- the
+    NVIDIA integration this test guards against regressing."""
+    import json
+    settings_path.write_text(json.dumps({"model": {"provider": "nvidia", "name": "meta/llama-3.1-8b-instruct"}}))
+    with patch.object(cli, "get_api_key", return_value="nv-key") as mock_get_key, \
+         patch.object(cli, "NvidiaProvider") as MockNvidia, \
+         patch.object(cli, "OpenRouterProvider") as MockOpenRouter, \
+         patch.object(cli, "Store") as MockStore:
+        MockStore.return_value.load.return_value = []
+        assistant, provider = cli.build_assistant(lambda action: True)
+    mock_get_key.assert_called_once_with("nvidia")
+    MockOpenRouter.assert_not_called()
+    # model settings merge one level deep with the defaults (config.load_settings),
+    # so an override that only sets provider/name still inherits the default fallbacks.
+    from raven.config import DEFAULT_SETTINGS
+    MockNvidia.assert_called_once_with(
+        api_key="nv-key", model="meta/llama-3.1-8b-instruct", fallbacks=DEFAULT_SETTINGS["model"]["fallbacks"],
+    )
+    assert provider is MockNvidia.return_value

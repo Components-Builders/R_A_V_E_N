@@ -3,8 +3,10 @@
  * main/renderer split). Mounts the React app; App.tsx owns everything from
  * here down.
  */
+
 import { createRoot } from 'react-dom/client';
 import './index.css';
+import 'highlight.js/styles/vs2015.css'
 import App from './App';
 
 const container = document.getElementById('root');

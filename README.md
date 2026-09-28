@@ -1,8 +1,10 @@
 # R.A.V.E.N
 
-CLI assistant. Currently uses Openrouter's API; swap in a local model later
-by writing a new class in `raven/llm_provider.py` that implements
-`LLMProvider.reply()` and using it in `cli.py`.
+CLI assistant. Supports two model providers out of the box -- OpenRouter
+and NVIDIA's free NIM API (build.nvidia.com) -- switchable in
+`~/.raven/settings.json` (`model.provider`) or from the desktop app's
+Settings panel; see "Model provider" below. Add another later by writing a
+new `LLMProvider` subclass in `raven/llm_provider.py`.
 
 ## Setup
 
@@ -20,6 +22,32 @@ raven                               # or: python -m raven.cli
 
 (Or put `OPENROUTER_API_KEY=...` in a `.env` file. Developers: `pip install -e ".[dev]"`
 gives an editable install plus the test tools. `pip install -r requirements.txt` still works too.)
+
+## Model provider
+
+Two providers work today:
+
+| | OpenRouter (default) | NVIDIA |
+|---|---|---|
+| `model.provider` | `"openrouter"` | `"nvidia"` |
+| API key env var | `OPENROUTER_API_KEY` | `NVIDIA_API_KEY` |
+| Get a free key | [openrouter.ai/keys](https://openrouter.ai/keys) | [build.nvidia.com](https://build.nvidia.com) (any model card's "Get API Key") |
+| Fallback models | one request, OpenRouter tries each in order | tried client-side, one HTTP call per candidate |
+| Picking a model | type an id into `settings.json` | listable from a key (desktop app) or typed manually |
+
+Switch providers by editing `~/.raven/settings.json`:
+
+```json
+{"model": {"provider": "nvidia", "name": "meta/llama-3.1-8b-instruct", "fallbacks": []}}
+```
+
+or from the desktop app: Settings → Model → pick a provider. Picking NVIDIA
+loads the models your key can access straight from NVIDIA's API (`list_models`
+in `raven/server.py`) into a dropdown; OpenRouter still takes a typed model
+id, since there's no listing endpoint wired up for it yet. Whichever you set
+here also applies to the CLI, since both read the same `settings.json`.
+Switching providers clears `fallbacks` (the old ones would be model ids for
+the *other* provider) -- set new ones by hand in `settings.json` if you need them.
 
 ## Desktop app
 
@@ -41,6 +69,27 @@ Linux `.deb` and `.rpm`. Installers are **unsigned** for now, so Windows SmartSc
 macOS Gatekeeper will warn on first launch (code signing needs a paid developer
 certificate). Each OS has to be built on that OS -- the `build-desktop` GitHub Action
 does all three on a tag or a manual run.
+
+### Voice mode (push-to-talk)
+
+The desktop app's "Voice" mode (left rail) is a second, independent voice
+input path from the CLI's `ctrl+v` -- it captures audio in the renderer
+(Web Audio API, no ffmpeg) and sends it to `raven/server.py`'s `transcribe`
+message, which runs it through the exact same offline faster-whisper
+pipeline (`raven/voice.py`) the CLI uses, so the same setup applies:
+`pip install ".[voice]"` and (Linux only) `libportaudio2`, plus the one-time
+`python -m raven.voice` model download.
+
+Hold **Shift** to record, release to stop. By default the transcript is
+shown for you to edit and explicitly Send or Discard -- never auto-sent,
+same posture as `ctrl+v`. Check "Send automatically on release" (top-right
+of the Voice stage) to skip review and send straight to the model instead;
+this is remembered across restarts (browser `localStorage`). Recording is
+disabled while disconnected or while a request is already in flight, and
+releasing Shift before the microphone finishes opening (a very fast tap) is
+handled cleanly rather than getting stuck. Electron grants microphone
+access to the app automatically (`main.ts`'s permission handler) -- only
+this window can ask.
 
 ## Headless mode
 

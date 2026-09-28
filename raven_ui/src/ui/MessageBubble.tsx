@@ -12,7 +12,7 @@ const MessageBubble = memo(function MessageBubble({ m }: { m: Message }) {
         <div
             className={[
                 'max-w-[78%] px-4 py-3 text-[0.92rem] leading-normal wrap-anywhere',
-                m.role === 'user' ? 'self-end bg-ink whitespace-pre-wrap text-white' : 'markdown self-start border border-line bg-panel',
+                m.role === 'user' ? 'self-end bg-strong whitespace-pre-wrap text-onstrong' : 'markdown self-start',
             ].join(' ')}
         >
             {m.role === 'raven' ? (
@@ -26,5 +26,26 @@ const MessageBubble = memo(function MessageBubble({ m }: { m: Message }) {
         </div>
     );
 });
+
+// rounded
+// const MessageBubble = memo(function MessageBubble({ m }: { m: Message }) {
+//     return (
+//         <div
+//             className={[
+//                 'max-w-[78%] px-4 py-3 text-[0.92rem] leading-normal wrap-anywhere',
+//                 m.role === 'user' ? 'self-end bg-ink whitespace-pre-wrap text-white rounded-3xl' : 'markdown self-start',
+//             ].join(' ')}
+//         >
+//             {m.role === 'raven' ? (
+//                 // No rehype-raw: raw HTML in a reply stays inert text, never live markup.
+//                 <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+//                     {m.text}
+//                 </Markdown>
+//             ) : (
+//                 m.text
+//             )}
+//         </div>
+//     );
+// });
 
 export default MessageBubble

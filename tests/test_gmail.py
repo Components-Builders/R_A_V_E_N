@@ -240,3 +240,95 @@ def test_send_reports_insufficient_permission_clearly():
         out = gmail.send_message("a@b.com", "s", "b")
     assert "insufficient Gmail permission" in out
     assert str(gmail.TOKEN_PATH) in out
+
+
+# ---------------------------------------------------------------------------
+# _get_service: a revoked/dead refresh token must trigger a fresh login,
+# never a raw crash and never a token that's retried forever unsuccessfully.
+# ---------------------------------------------------------------------------
+
+class FakeCreds:
+    """Stands in for google.oauth2.credentials.Credentials."""
+    def __init__(self, valid=False, expired=True, refresh_token="rt", refresh_error=None):
+        self.valid = valid
+        self.expired = expired
+        self.refresh_token = refresh_token
+        self._refresh_error = refresh_error
+        self.refreshed = False
+
+    def refresh(self, request):
+        self.refreshed = True
+        if self._refresh_error:
+            raise self._refresh_error
+        self.valid = True
+
+    def to_json(self):
+        return '{"fake": true}'
+
+
+@pytest.fixture
+def gmail_service_fixture(tmp_path, monkeypatch):
+    """Points CREDENTIALS_PATH/TOKEN_PATH at a throwaway dir and resets the
+    module-level cached _service, so _get_service() runs its real logic."""
+    monkeypatch.setattr(gmail, "CREDENTIALS_PATH", tmp_path / "creds.json")
+    monkeypatch.setattr(gmail, "TOKEN_PATH", tmp_path / "token.json")
+    monkeypatch.setattr(gmail, "_service", None)
+    gmail.CREDENTIALS_PATH.write_text("{}")
+    return tmp_path
+
+
+def _patch_google_auth(monkeypatch, from_file_return, refresh_error_cls, flow_creds=None, build_return="SERVICE"):
+    """Patches the lazily-imported google-auth/googleapiclient names exactly
+    where _get_service() imports them from."""
+    import types
+    fake_creds_mod = types.SimpleNamespace(Credentials=MagicMock(from_authorized_user_file=MagicMock(return_value=from_file_return)))
+    fake_flow = MagicMock()
+    fake_flow.from_client_secrets_file.return_value.run_local_server.return_value = flow_creds
+    monkeypatch.setitem(__import__("sys").modules, "google.oauth2.credentials", fake_creds_mod)
+    monkeypatch.setitem(__import__("sys").modules, "google_auth_oauthlib.flow",
+                         types.SimpleNamespace(InstalledAppFlow=fake_flow))
+    monkeypatch.setitem(__import__("sys").modules, "googleapiclient.discovery",
+                         types.SimpleNamespace(build=MagicMock(return_value=build_return)))
+    monkeypatch.setitem(__import__("sys").modules, "google.auth.transport.requests",
+                         types.SimpleNamespace(Request=MagicMock()))
+    monkeypatch.setitem(__import__("sys").modules, "google.auth.exceptions",
+                         types.SimpleNamespace(RefreshError=refresh_error_cls))
+    monkeypatch.setitem(__import__("sys").modules, "google_auth_httplib2",
+                         types.SimpleNamespace(AuthorizedHttp=MagicMock()))
+    monkeypatch.setitem(__import__("sys").modules, "httplib2", types.SimpleNamespace(Http=MagicMock()))
+    return fake_flow
+
+
+def test_a_revoked_refresh_token_falls_through_to_a_fresh_login_not_a_crash(gmail_service_fixture, monkeypatch):
+    class FakeRefreshError(Exception):
+        pass
+
+    dead = FakeCreds(valid=False, expired=True, refresh_token="rt", refresh_error=FakeRefreshError("invalid_grant"))
+    fresh = FakeCreds(valid=True)
+    fake_flow = _patch_google_auth(monkeypatch, from_file_return=dead, refresh_error_cls=FakeRefreshError, flow_creds=fresh)
+    gmail_service_fixture.joinpath("token.json").write_text('{"stale": true}')
+
+    service = gmail._get_service()
+
+    assert dead.refreshed is True  # it did try the cheap path first
+    fake_flow.from_client_secrets_file.assert_called_once_with(str(gmail.CREDENTIALS_PATH), gmail.SCOPES)
+    fake_flow.from_client_secrets_file.return_value.run_local_server.assert_called_once()
+    assert service == "SERVICE"
+    # the new, working credentials were persisted -- not left pointing at the dead ones
+    assert gmail.TOKEN_PATH.read_text() == fresh.to_json()
+
+
+def test_an_ordinary_expired_token_still_just_refreshes(gmail_service_fixture, monkeypatch):
+    """Regression guard: the revoked-token fix must not turn the common,
+    successful refresh path into a full re-login every time."""
+    class FakeRefreshError(Exception):
+        pass
+
+    ok = FakeCreds(valid=False, expired=True, refresh_token="rt")  # refresh() succeeds, sets valid=True
+    fake_flow = _patch_google_auth(monkeypatch, from_file_return=ok, refresh_error_cls=FakeRefreshError)
+    gmail_service_fixture.joinpath("token.json").write_text('{"stale": true}')
+
+    gmail._get_service()
+
+    assert ok.refreshed is True
+    fake_flow.from_client_secrets_file.assert_not_called()  # never fell through to a browser login

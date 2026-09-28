@@ -17,7 +17,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
 from raven.config import get_api_key, load_settings, save_settings, SETTINGS_PATH, NOTES_PATH
-from raven.llm_provider import OpenRouterProvider, load_project_rules
+from raven.llm_provider import LLMProvider, NvidiaProvider, OpenRouterProvider, load_project_rules
 from raven.assistant import Assistant
 from raven.store import Store
 from raven import tools, statusline, voice
@@ -488,19 +488,25 @@ def is_exit_command(user_input: str) -> bool:
     return command in ("/exit", "/quit") or user_input.lower() in ("exit", "quit")
 
 
-def build_assistant(confirm_run_fn) -> tuple[Assistant, OpenRouterProvider]:
+def build_assistant(confirm_run_fn) -> tuple[Assistant, LLMProvider]:
     """Construct the provider + Assistant. Shared by the interactive REPL and
     headless -p mode so the two can't drift apart. Populates the module-level
-    SETTINGS/ASSISTANT globals (used by /statusline, /forget, the toolbar)."""
+    SETTINGS/ASSISTANT globals (used by /statusline, /forget, the toolbar).
+
+    Which LLMProvider subclass gets built (OpenRouter, NVIDIA, ...) is
+    settings.json's model.provider. Branches directly on OpenRouterProvider/
+    NvidiaProvider here (not llm_provider.build_provider's shared PROVIDERS
+    dict) so `patch.object(cli, "OpenRouterProvider")` keeps working in
+    tests -- same "small, deliberate duplication over cross-module coupling"
+    tradeoff server.py's own _build_assistant already documents."""
     global ASSISTANT
     SETTINGS.clear()
     SETTINGS.update(load_settings())
     model_cfg = SETTINGS["model"]
-    provider = OpenRouterProvider(
-        api_key=get_api_key(),
-        model=model_cfg["name"],
-        fallbacks=model_cfg.get("fallbacks", []),
-    )
+    provider_name = model_cfg.get("provider", "openrouter")
+    api_key = get_api_key(provider_name)
+    provider_cls = NvidiaProvider if provider_name == "nvidia" else OpenRouterProvider
+    provider = provider_cls(api_key=api_key, model=model_cfg["name"], fallbacks=model_cfg.get("fallbacks", []))
     assistant = ASSISTANT = Assistant(provider, confirm_run=confirm_run_fn, store=Store(), settings=SETTINGS)
     return assistant, provider
 
