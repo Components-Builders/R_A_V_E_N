@@ -617,16 +617,44 @@ def test_ask_returns_final_text_and_runs_the_tool_in_between():
     assert [m["role"] for m in a.history] == ["user", "assistant", "tool", "assistant"]
 
 
-def test_ask_stops_at_the_iteration_cap_instead_of_looping_forever():
-    from raven.assistant import MAX_TOOL_ITERATIONS
+def _looping_provider(n):
+    """A provider that asks for the same tool `n` times and never finishes —
+    the shape that makes the iteration cap the only thing ending the turn."""
     call = {"role": "assistant", "content": None,
             "tool_calls": [{"id": "c", "function": {"name": "list_dir", "arguments": "{}"}}]}
-    provider = ScriptedProvider([call] * MAX_TOOL_ITERATIONS)
+    return ScriptedProvider([call] * n)
+
+
+def test_ask_stops_at_the_iteration_cap_instead_of_looping_forever():
+    from raven.assistant import MAX_TOOL_ITERATIONS
+    provider = _looping_provider(MAX_TOOL_ITERATIONS)
     with patch("raven.tools.TOOL_FUNCTIONS", {**__import__("raven.tools", fromlist=["x"]).TOOL_FUNCTIONS,
                                               "list_dir": lambda: "..."}):
         reply = Assistant(provider).ask("loop forever")
-    assert "tool-call limit" in reply
+    assert str(MAX_TOOL_ITERATIONS) in reply
+    assert "continue" in reply  # the turn's work is kept; say so rather than just stopping
     assert len(provider.calls) == MAX_TOOL_ITERATIONS
+
+
+def test_iteration_cap_is_configurable_from_settings():
+    """A tool-heavy workflow can raise the ceiling without editing the source."""
+    provider = _looping_provider(3)
+    a = Assistant(provider, settings={"limits": {"tool_iterations": 3}})
+    assert a.max_tool_iterations == 3
+    with patch("raven.tools.TOOL_FUNCTIONS", {**__import__("raven.tools", fromlist=["x"]).TOOL_FUNCTIONS,
+                                              "list_dir": lambda: "..."}):
+        reply = a.ask("loop forever")
+    assert len(provider.calls) == 3
+    assert "3 tool rounds" in reply
+
+
+@pytest.mark.parametrize("bad", ["lots", None, 0, -5, True, 2.5])
+def test_a_bad_iteration_limit_falls_back_to_the_default_instead_of_raising(bad):
+    """A typo in a hand-edited settings.json must not make Assistant
+    unconstructible — and `True` must not sneak through as the int 1."""
+    from raven.assistant import MAX_TOOL_ITERATIONS
+    a = Assistant(ScriptedProvider([]), settings={"limits": {"tool_iterations": bad}})
+    assert a.max_tool_iterations == MAX_TOOL_ITERATIONS
 
 
 def test_ask_rolls_back_history_on_keyboard_interrupt():

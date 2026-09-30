@@ -8,6 +8,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SETTINGS_PATH = Path.home() / ".raven" / "settings.json"
+
+# How many model round trips one turn may take before giving up. Lives here,
+# not in assistant.py, purely so DEFAULT_SETTINGS below and the Assistant that
+# reads it can't drift apart — assistant.py imports it from here and carries
+# the full rationale for why this is bounded at all rather than unlimited.
+DEFAULT_TOOL_ITERATIONS = 25
 NOTES_PATH = Path.home() / ".raven" / "memory" / "notes.md"  # model-written, cross-session (B3)
 
 DEFAULT_SETTINGS = {
@@ -33,6 +39,11 @@ DEFAULT_SETTINGS = {
     },
     # Status-line segments, in display order. Available names live in statusline.SEGMENTS.
     "statusline": {"segments": ["model", "context", "tokens", "memory"]},
+    # Per-turn ceilings the user can raise without editing the source.
+    # tool_iterations: how many model round trips one turn may take before
+    # giving up — see assistant.py's own comment for why this is bounded at
+    # all rather than unlimited.
+    "limits": {"tool_iterations": DEFAULT_TOOL_ITERATIONS},
     # C3: user-opt-in trust, ADDITIVE only — never removes the built-in safety
     # checks (SAFE_COMMANDS/SAFE_GIT, or the shell-metacharacter defeat
     # detection, which always applies regardless of this list). e.g.
@@ -87,7 +98,7 @@ def load_settings() -> dict:
     if not SETTINGS_PATH.exists():
         return settings
     try:
-        overrides = json.loads(SETTINGS_PATH.read_text())
+        overrides = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return settings
     for section, value in overrides.items():
@@ -101,4 +112,4 @@ def load_settings() -> dict:
 def save_settings(settings: dict) -> None:
     """Persist settings to ~/.raven/settings.json."""
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n")
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")

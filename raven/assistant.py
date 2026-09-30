@@ -7,13 +7,37 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from raven.config import DEFAULT_TOOL_ITERATIONS
 from raven.llm_provider import LLMProvider, SKILL_PROMPTS
 from raven.store import Store
 from raven import gmail as gmail_impl
 from raven import platforms as plat
 from raven import tools as tool_impl
 
-MAX_TOOL_ITERATIONS = 10  # was 5; browser workflows (navigate/read/act/verify) routinely need more
+# How many model round trips one turn may take before giving up. NOT a
+# per-tool-call cap: several tool_calls returned in a SINGLE message all run
+# within one iteration, so a model that batches its calls goes much further on
+# the same budget than one that emits them one at a time.
+#
+# Raised from 10 to 25 after a real failure (2026-10-01): "read this 305-file
+# project, then generate an HTML page from it" exhausted 10 round trips on
+# exploration alone and bailed out AFTER writing the file but before the model
+# could say so -- the user saw only the give-up message and reasonably assumed
+# nothing had happened.
+#
+# Deliberately still bounded rather than unlimited. The loop's exit condition
+# is "the model stopped asking for tools", which is the model's decision, not
+# ours: a model that loops -- re-reading the same file, retrying a failing
+# command, oscillating between two tools -- would otherwise run until the API
+# key's quota, the user's money, or the process ran out, with no natural stop.
+# The desktop app and headless mode have no Ctrl+C to break it, and every
+# iteration is a real billable request. A bound guarantees every turn
+# terminates; the user can always continue (history is kept, see _run_turn's
+# bail-out message), which makes an occasional early stop cheap and an endless
+# loop impossible. Users who want a different ceiling set
+# settings.json's limits.tool_iterations. The number itself lives in
+# config.DEFAULT_TOOL_ITERATIONS so it can't drift from DEFAULT_SETTINGS.
+MAX_TOOL_ITERATIONS = DEFAULT_TOOL_ITERATIONS  # back-compat alias for anything importing the old name
 # ~12k tokens (chars/4 approximation) of history sent per request. This is a
 # practicality budget, not a model context-window limit — the free models
 # behind the default fallback list have context windows in the hundreds of
@@ -259,6 +283,16 @@ class Assistant:
         # above (settings.json is a local file the user controls) -- never
         # confirmed, since being listed here IS the user's approval.
         self.hooks = (settings or {}).get("hooks", {"pre": {}, "post": {}})
+        # Per-turn round-trip ceiling (see DEFAULT_TOOL_ITERATIONS). Read off
+        # settings so a user whose work is genuinely tool-heavy can raise it
+        # without editing the source. A non-int or non-positive value falls
+        # back to the default rather than raising: a typo in a hand-edited
+        # settings.json must not make the assistant unconstructible.
+        limit = (settings or {}).get("limits", {}).get("tool_iterations", DEFAULT_TOOL_ITERATIONS)
+        self.max_tool_iterations = (
+            limit if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
+            else DEFAULT_TOOL_ITERATIONS
+        )
         # D2: which skills this SESSION has unlocked so far (see load_skill).
         # Purely in-memory, never persisted -- a fresh session always starts
         # back at core-only, same reasoning as B2's compacted summary: Store
@@ -297,7 +331,7 @@ class Assistant:
         return reply
 
     def _run_turn(self) -> str:
-        for _ in range(MAX_TOOL_ITERATIONS):
+        for _ in range(self.max_tool_iterations):
             message = self.provider.reply(self._context(), tools=self._active_tool_specs())
             if message.get("content"):
                 message["content"] = strip_emoji(message["content"])
@@ -310,7 +344,16 @@ class Assistant:
             for call in tool_calls:
                 result = self._run_tool(call)
                 self.history.append({"role": "tool", "tool_call_id": call["id"], "content": result})
-        return "I hit the tool-call limit for this request — let me know how you'd like to proceed."
+        # Say what actually happened, not just that something stopped: the work
+        # done so far IS kept (every tool result is already in self.history), so
+        # "continue" resumes with a fresh budget instead of starting over. The
+        # old message said none of this, and a user who had just had a file
+        # written for them had no way to know it existed.
+        return (
+            f"I reached this turn's limit of {self.max_tool_iterations} tool rounds before finishing. "
+            f"Everything done so far is kept — say \"continue\" and I'll pick up where I left off. "
+            f"Raise limits.tool_iterations in settings.json if this keeps happening."
+        )
 
     def _context(self) -> list[dict]:
         """The tail of history to send to the model: as much recent history as

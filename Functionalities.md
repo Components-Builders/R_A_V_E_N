@@ -636,7 +636,19 @@ to the prompt text.
   round trips (and `NvidiaProvider`'s own back-to-back fallback calls).
 - **Token accounting** comes from the API's `usage` figures.
 - **Settings** (all optional) live in `~/.raven/settings.json`: `model.provider`,
-  `model.name`, `model.fallbacks`, `statusline.segments`.
+  `model.name`, `model.fallbacks`, `model.vision`, `statusline.segments`,
+  `permissions`, `hooks`, `limits.tool_iterations`.
+- **Tool-round budget per turn (Step 3.76):** `limits.tool_iterations`
+  (default 25) caps how many times one request may go back to the model
+  before giving up. It counts model *round trips*, not tool calls —
+  several `tool_calls` in a single message all run inside one iteration,
+  so a model that batches them travels much further on the same budget.
+  It is deliberately bounded rather than unlimited: the loop only ends
+  when the model itself stops asking for tools, and a model that loops
+  would otherwise run until the quota or the money ran out, with no
+  Ctrl+C available in the desktop app or headless mode. On reaching it,
+  the turn's work is **kept** — saying "continue" resumes with a fresh
+  budget rather than starting over.
 - **Swappable provider:** implement `LLMProvider.reply()` in
   `raven/llm_provider.py`; `cli.py`/`server.py` each branch on
   `model.provider` to pick the class.
@@ -649,6 +661,12 @@ to the prompt text.
   conflict). Each capped at ~4000 characters. Reported on startup when found.
 
 ### Files R.A.V.E.N reads or writes
+
+All text files are read and written as **UTF-8**, on every OS (Step 3.76).
+Reading falls back to the platform's locale encoding for a genuinely legacy
+non-UTF-8 file, so an older cp1252 file stays readable; writing is always
+UTF-8, never the locale encoding.
+
 
 | Path | Purpose |
 |---|---|

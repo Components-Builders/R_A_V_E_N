@@ -80,7 +80,7 @@ def _get_service():
             # revoked or expires.
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
             creds = flow.run_local_server(port=0)
-        TOKEN_PATH.write_text(creds.to_json())
+        TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
     # Pin a socket timeout: Google's client has none by default, so a stalled
     # connection would hang forever — same class of bug as the OpenRouter hang
     # (DEV_LOG Step 3.11), and now reachable from inside the confirmation

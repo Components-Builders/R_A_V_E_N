@@ -1,6 +1,7 @@
 """CLI entry point for R.A.V.E.N."""
 import argparse
 import getpass
+import sys
 
 from pathlib import Path
 
@@ -199,12 +200,12 @@ def handle_notes(_args: str = ""):
     """Read-only view of ~/.raven/memory/notes.md — writes only happen via
     the model's save_note tool, deliberately (see Step 3.36); this is just
     visibility into what's currently loaded at startup."""
-    if not NOTES_PATH.is_file() or not NOTES_PATH.read_text().strip():
+    if not NOTES_PATH.is_file() or not NOTES_PATH.read_text(encoding="utf-8").strip():
         console.print(f"[dim]No notes saved yet ({NOTES_PATH}).[/]")
         console.print()
         return
     console.print(f"[dim]{NOTES_PATH}:[/]")
-    console.print(NOTES_PATH.read_text().strip())
+    console.print(NOTES_PATH.read_text(encoding="utf-8").strip())
     console.print()
 
 
@@ -537,6 +538,18 @@ def run_headless(prompt: str, auto_confirm: bool = False) -> None:
     no PromptSession, no Rich styling, so the output stays pipeable/scriptable.
     Confirmation-gated tool calls are DENIED by default (never silently
     approved just because no one's watching); pass auto_confirm to opt in."""
+    # Found live on Windows (2026-10-01): `print(reply)` below raised
+    # UnicodeEncodeError and killed the whole run whenever the model's answer
+    # contained any character outside the console's codepage -- a narrow
+    # no-break space (U+202F) in an otherwise ordinary French sentence was
+    # enough. Python picks the locale encoding for stdout (cp1252 on a French
+    # Windows install), and headless mode prints straight to it rather than
+    # through Rich, which does its own encoding handling -- so this path, and
+    # only this path, needed the explicit reconfigure. errors="replace" keeps
+    # a terminal that genuinely can't render UTF-8 printing something rather
+    # than failing the request outright.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     confirm = (lambda action: True) if auto_confirm else (lambda action: False)
     assistant, _ = build_assistant(confirm)
     try:

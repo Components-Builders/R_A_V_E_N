@@ -780,3 +780,62 @@ def test_vision_skill_contains_analyze_image():
 
 def test_browser_skill_contains_screenshot():
     assert "browser_screenshot" in tools.SKILLS["browser"]
+
+
+# ---------------------------------------------------------------------------
+# Text encoding (2026-10-01). Path.read_text()/write_text() with no `encoding`
+# use the LOCALE encoding, which is cp1252 on a French Windows install, not
+# UTF-8. Found live: write_file produced an HTML page declaring
+# <meta charset="UTF-8"> that was actually cp1252 on disk, so every accented
+# character rendered as a replacement glyph in the browser.
+#
+# These tests assert on the BYTES on disk, not on what a round trip through
+# the same functions returns — a read and a write that are wrong in the same
+# way round-trip perfectly and hide the bug entirely.
+# ---------------------------------------------------------------------------
+
+ACCENTS = "Fréquence des vagues — 30 % d'amplitude « test »"
+
+
+def test_write_file_writes_utf8_regardless_of_the_platform_locale(tmp_path):
+    target = tmp_path / "page.html"
+    tools.write_file(str(target), ACCENTS)
+    assert target.read_bytes().decode("utf-8") == ACCENTS
+
+
+def test_write_file_handles_characters_absent_from_cp1252(tmp_path):
+    """The crash case, not just the mojibake case: a narrow no-break space
+    (U+202F) has no cp1252 equivalent at all, so the old code raised
+    UnicodeEncodeError and lost the write outright."""
+    target = tmp_path / "note.txt"
+    texte = "espace fine insécable et emoji \U0001F30A"
+    tools.write_file(str(target), texte)
+    assert target.read_bytes().decode("utf-8") == texte
+
+
+def test_read_file_reads_utf8(tmp_path):
+    source = tmp_path / "in.txt"
+    source.write_bytes(ACCENTS.encode("utf-8"))
+    assert tools.read_file(str(source)) == ACCENTS
+
+
+def test_read_file_still_reads_a_legacy_non_utf8_file(tmp_path):
+    """Strict UTF-8 on read would turn a previously-working read_file into a
+    hard error for any pre-existing cp1252 file, so there's a fallback."""
+    source = tmp_path / "legacy.txt"
+    source.write_bytes("café".encode("cp1252"))
+    assert "caf" in tools.read_file(str(source))  # decoded, not raised
+
+
+def test_edit_file_keeps_the_file_utf8(tmp_path):
+    target = tmp_path / "page.html"
+    target.write_bytes("<p>ancien</p>".encode("utf-8"))
+    tools.edit_file(str(target), "ancien", "nouveau — révisé")
+    assert target.read_bytes().decode("utf-8") == "<p>nouveau — révisé</p>"
+
+
+def test_save_note_writes_utf8(tmp_path):
+    notes = tmp_path / "notes.md"
+    with patch.object(tools, "NOTES_PATH", notes):
+        tools.save_note("préférence : accents conservés")
+    assert "préférence" in notes.read_bytes().decode("utf-8")

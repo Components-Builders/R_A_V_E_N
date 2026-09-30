@@ -187,6 +187,23 @@ project's actual test suite — same confirmation policy as `run_command`, but
 with a 120s timeout instead of 30s, since a real test suite (this project's
 own included) can legitimately take longer than a quick shell command.
 
+## Tool-round budget
+
+One request can go back to the model at most `limits.tool_iterations` times
+(default 25) before it stops and reports back:
+
+```json
+{"limits": {"tool_iterations": 40}}
+```
+
+It counts model **round trips**, not tool calls — several tool calls returned
+in one message all run within a single iteration. It is bounded on purpose:
+the loop ends only when the model itself stops asking for tools, so an
+unbounded one would run until your quota or your money ran out, with no Ctrl+C
+in the desktop app or headless mode. Reaching it never throws work away — the
+conversation keeps everything done so far, and "continue" picks up where it
+stopped.
+
 ## Permissions
 
 By default, `run_command`/`run_tests` confirm unless the command is a plain

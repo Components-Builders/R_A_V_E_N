@@ -126,7 +126,7 @@ def _load_rules_file(path: Path, label: str) -> str:
     if not path.is_file():
         return ""
     try:
-        content = path.read_text(errors="ignore").strip()
+        content = path.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return ""
     if not content:
@@ -177,7 +177,7 @@ def load_notes(notes_path: Path | None = None) -> str:
     if not path.is_file():
         return ""
     try:
-        content = path.read_text(errors="ignore").strip()
+        content = path.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return ""
     if not content:

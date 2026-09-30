@@ -34,7 +34,7 @@ def _installed_apps() -> dict[str, str]:
             continue
         for desktop_file in directory.glob("*.desktop"):
             try:
-                lines = desktop_file.read_text(errors="ignore").splitlines()
+                lines = desktop_file.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
                 continue
             name, no_display, sections_seen = None, False, 0
@@ -59,7 +59,7 @@ def _binary_name(app_id: str) -> str | None:
         if not desktop_file.is_file():
             continue
         try:
-            for line in desktop_file.read_text(errors="ignore").splitlines():
+            for line in desktop_file.read_text(encoding="utf-8", errors="replace").splitlines():
                 if line.startswith("Exec="):
                     cmd = line.split("=", 1)[1].strip().split()
                     if not cmd:

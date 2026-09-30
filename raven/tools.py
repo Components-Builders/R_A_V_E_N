@@ -2,6 +2,7 @@
 import difflib
 import html
 import json
+import locale
 import os
 import re
 import signal
@@ -47,12 +48,44 @@ def _is_existing_file(path: str) -> bool:
         return True
 
 
+def _read_text(file: Path) -> str:
+    """Read a text file as UTF-8, falling back to the platform's locale
+    encoding for a legacy file that genuinely isn't UTF-8.
+
+    Explicit encoding matters most on Windows: `Path.read_text()` with no
+    `encoding` uses the *locale* encoding (cp1252 on a French install), not
+    UTF-8, so any file containing a character outside that codepage raised
+    UnicodeDecodeError on read. UTF-8 first covers everything this agent
+    writes itself (see `_write_text`); the fallback keeps a pre-existing
+    cp1252 file readable rather than turning a previously-working
+    `read_file` into a hard error.
+    """
+    try:
+        return file.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return file.read_text(encoding=locale.getpreferredencoding(False), errors="replace")
+
+
+def _write_text(file: Path, content: str) -> None:
+    """Always write UTF-8, never the locale encoding.
+
+    Found live on Windows (2026-10-01): `write_file` produced an HTML page
+    that declared `<meta charset="UTF-8">` but was actually written as
+    cp1252, so every accented character rendered as a replacement glyph in
+    the browser. `Path.write_text()` with no `encoding` picks the locale
+    encoding, which on a French Windows install is cp1252 -- and a character
+    outside that codepage (a curly quote, an em dash, an emoji) raises
+    UnicodeEncodeError outright instead of just mangling the output.
+    """
+    file.write_text(content, encoding="utf-8")
+
+
 def read_file(path: str) -> str:
-    return _truncate(resolve(path).read_text())
+    return _truncate(_read_text(resolve(path)))
 
 
 def write_file(path: str, content: str = "") -> str:
-    resolve(path).write_text(content)
+    _write_text(resolve(path), content)
     return f"Wrote {path}"
 
 
@@ -83,12 +116,12 @@ def save_note(note: str) -> str:
     if len(note) > MAX_NOTE_CHARS:
         return f"Error: note too long ({len(note)} chars, max {MAX_NOTE_CHARS}). Keep it to one concise fact."
     NOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    existing = NOTES_PATH.read_text() if NOTES_PATH.exists() else ""
+    existing = _read_text(NOTES_PATH) if NOTES_PATH.exists() else ""
     line = f"- {note}\n"
     if len(existing) + len(line) > MAX_NOTES_FILE_CHARS:
         return (f"Error: memory is full ({MAX_NOTES_FILE_CHARS}-char cap). "
                 f"Ask the user before removing old notes to make room.")
-    NOTES_PATH.write_text(existing + line)
+    _write_text(NOTES_PATH, existing + line)
     return f"Saved note: {note}"
 
 
@@ -128,13 +161,13 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
     if not old_string:
         return "Error: old_string must not be empty."
     file = resolve(path)
-    content = file.read_text()
+    content = _read_text(file)
     count = content.count(old_string)
     if count == 0:
         return f"Error: old_string not found in {path}."
     if count > 1:
         return f"Error: old_string matches {count} times in {path} -- include more context to make it unique."
-    file.write_text(content.replace(old_string, new_string, 1))
+    _write_text(file, content.replace(old_string, new_string, 1))
     return f"Edited {path}"
 
 
@@ -240,7 +273,7 @@ def grep(pattern: str, path: str = ".", glob: str = "**/*") -> str:
         if _looks_binary(file):
             continue
         try:
-            text = file.read_text(errors="ignore")
+            text = _read_text(file)
         except OSError:
             continue
         for lineno, line in enumerate(text.splitlines(), start=1):
