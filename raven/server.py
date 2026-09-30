@@ -41,6 +41,21 @@ def _build_assistant(confirm_run_fn, on_tool_call_fn, store) -> Assistant:
     )
 
 
+class _AskToken:
+    """One per in-flight ask() call, so cancel_ask() marks exactly THAT call
+    cancelled -- never a later one. Needed because Assistant.ask() runs in a
+    real OS thread (asyncio.to_thread): unlike the CLI's own Ctrl+C (a signal
+    the OS delivers into the blocking call itself), nothing here can forcibly
+    stop that thread mid-network-call. Cancelling instead marks the token and
+    waits for the call to finish naturally; _run_ask then rolls the turn back
+    from history rather than reporting it, the same "half-finished turn can't
+    pollute later context" guarantee Assistant.ask's own KeyboardInterrupt
+    handler already gives the CLI."""
+
+    def __init__(self):
+        self.cancelled = False
+
+
 MAX_HISTORY_ITEMS = 200
 
 
@@ -66,6 +81,7 @@ class Session:
         self.store = Store()
         self.assistant = _build_assistant(self._confirm_run, self._on_tool_call, self.store)
         self._stats_task: asyncio.Task | None = None   # NEW
+        self._ask_token: _AskToken | None = None  # the in-flight ask(), if any -- see _AskToken
 
     # -- stats push ----------------------------------------------------------
 
@@ -84,15 +100,28 @@ class Session:
         """Push a statusline snapshot every STATS_INTERVAL_S while the socket
         is open. Timer-driven rather than reply-driven because cpu/mem
         change on their own between turns. Runs on the event loop (unlike
-        _run_ask): a fast psutil read plus an async send, nothing to offload."""
+        _run_ask): a fast psutil read plus an async send, nothing to offload.
+
+        Sleeps FIRST, then sends -- not the other way around. This task starts
+        immediately on connect, at the same moment _send_history() (also
+        triggered on connect, by the client's own get_history) sends its own
+        explicit stats snapshot; sending here too, immediately, raced that
+        explicit push on every fresh connection with no guaranteed order,
+        which is genuinely redundant (both would report the same near-instant
+        state) and made "connect, send one message, expect the very next
+        message to be its reply" -- true of nearly every caller -- fail
+        unpredictably (found via a real CI run turning red across all three
+        OSes). Deferring the first tick by a full interval leaves that
+        request/reply exchange an interval-sized window with no competing
+        background push."""
         while True:
+            await asyncio.sleep(STATS_INTERVAL_S)
             try:
                 await self._send_stats()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("stats push failed")     # NEW -- visible in terminal
-            await asyncio.sleep(STATS_INTERVAL_S)
 
     async def _send_stats(self) -> None:               # FIXED
         from raven import statusline
@@ -108,7 +137,22 @@ class Session:
                 log.warning("unknown statusline segment: %r", name)
                 continue
             try:
-                segments.append({"name": name, "text": fn(self.assistant.provider, self.assistant)})
+                text = fn(self.assistant.provider, self.assistant)
+                # A segment can fail WITHOUT raising: e.g. a test's mocked provider
+                # (or any future provider missing an expected attribute/method)
+                # auto-generates further mocks for any attribute access or call,
+                # so a chain like `provider.last_model.split("/")[-1]` returns
+                # another mock object silently instead of erroring. That mock is
+                # not JSON-serializable, and unlike an exception here, a bad
+                # VALUE was never being caught -- it reached send_json() below
+                # and crashed the whole websocket connection (found via a real
+                # CI run: every test_server.py test failed this way, not just
+                # the ones actually about stats). Guarding the type turns that
+                # into the same "skip this one segment" outcome as any other
+                # segment failure.
+                if not isinstance(text, str):
+                    raise TypeError(f"segment {name!r} returned {type(text).__name__}, not str")
+                segments.append({"name": name, "text": text})
             except Exception:                          # noqa: BLE001
                 log.exception("statusline segment %r failed", name)
         await self.websocket.send_json({"type": "stats", "segments": segments})
@@ -173,9 +217,30 @@ class Session:
             await self._send_sessions()
             return
         if msg_type == "ask":
-            task = asyncio.create_task(self._run_ask(data.get("text", "")))
+            if self._ask_token is not None:
+                # Nothing currently stops two "ask" calls from mutating
+                # self.assistant.history concurrently from two different
+                # threads -- refusing a second one while the first (cancelled
+                # or not) hasn't actually settled yet is what keeps that safe.
+                await self.websocket.send_json(
+                    {"type": "error", "message": "Wait for the current request to finish (or cancel it) before sending another."}
+                )
+                return
+            token = self._ask_token = _AskToken()
+            task = asyncio.create_task(self._run_ask(data.get("text", ""), token))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            return
+        if msg_type == "cancel_ask":
+            if self._ask_token is None:
+                await self.websocket.send_json({"type": "error", "message": "Nothing to cancel."})
+                return
+            self._ask_token.cancelled = True
+            # Acknowledges the request was received -- NOT that the turn has
+            # settled (the underlying call is still genuinely running; only
+            # _run_ask's own "cancelled" message, once it actually finishes,
+            # means the UI is free to send another message).
+            await self.websocket.send_json({"type": "cancel_requested"})
             return
         if msg_type == "transcribe":
             # Independent of ask()/session switching -- it never touches self.assistant
@@ -242,14 +307,48 @@ class Session:
             "type": "sessions", "current": self.store.session_id, "items": self.store.list_sessions(),
         })
 
-    async def _run_ask(self, text: str) -> None:
+    async def _run_ask(self, text: str, token: _AskToken) -> None:
+        checkpoint = len(self.assistant.history)
         try:
             reply = await asyncio.to_thread(self.assistant.ask, text)
-            await self.websocket.send_json({"type": "reply", "text": reply})
-            await self._send_sessions()
-            await self._send_stats()                   # NEW -- refresh token/context at turn end
         except Exception as e:
-            await self.websocket.send_json({"type": "error", "message": str(e)})
+            self._ask_token = None
+            # A cancelled call that then also happens to fail (e.g. the model
+            # request errors out after the user gave up on it) is still just
+            # a cancellation from the user's point of view -- no need to show
+            # a scary error for something they already dismissed.
+            if not token.cancelled:
+                await self.websocket.send_json({"type": "error", "message": str(e)})
+            else:
+                await self.websocket.send_json({"type": "cancelled"})
+            return
+        self._ask_token = None
+        if token.cancelled:
+            # The call ran to completion regardless (a real OS thread can't be
+            # forcibly interrupted) -- roll the turn back exactly like the
+            # CLI's own Ctrl+C/KeyboardInterrupt handling in Assistant.ask,
+            # and never report the answer the user already dismissed. KNOWN
+            # LIMITATION, stated plainly rather than silently accepted:
+            # Assistant.ask() already called its own _persist() before
+            # returning here, so the discarded turn is still sitting in the
+            # SQLite store on disk even though it's now gone from the live
+            # self.assistant.history -- this session's UI/model context is
+            # correct either way, but a full app restart afterward would load
+            # the "cancelled" turn back from disk. The CLI's own Ctrl+C
+            # avoids this entirely (there, cancellation is a real
+            # KeyboardInterrupt raised INSIDE _run_turn, which skips
+            # Assistant.ask's _persist() call by propagating out before
+            # reaching it) -- not available here since a background OS thread
+            # can't be interrupted that way. Fixing this fully would need a
+            # new Store method to delete specific rows after the fact; not
+            # done, since the common case (keep using this session) is
+            # already correct.
+            del self.assistant.history[checkpoint:]
+            await self.websocket.send_json({"type": "cancelled"})
+            return
+        await self.websocket.send_json({"type": "reply", "text": reply})
+        await self._send_sessions()
+        await self._send_stats()                   # NEW -- refresh token/context at turn end
 
     # -- voice input -----------------------------------------------------------
     # Push-to-talk from the desktop UI: the renderer captures raw audio (Web

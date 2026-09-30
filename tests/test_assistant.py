@@ -13,6 +13,7 @@ import pytest
 import raven.assistant as assistant_module
 from raven.assistant import Assistant, strip_emoji
 from raven import gmail as gmail_impl
+from raven import platforms
 from raven import tools as tool_impl
 
 
@@ -197,12 +198,22 @@ UNSAFE_PIPELINE_COMMANDS = [
 
 
 @pytest.mark.parametrize("command", SAFE_PIPELINE_COMMANDS)
-def test_run_command_read_only_pipelines_skip_confirmation(command):
+def test_run_command_read_only_pipelines_skip_confirmation(command, monkeypatch):
+    """These use POSIX-only syntax (`2>/dev/null`, single-quoted sed ranges),
+    which genuinely needs confirmation on REAL Windows (different redirect
+    and quoting rules -- see assistant.py's _split_safe_pipeline). Found via
+    real Windows CI: forcing is_windows() False here tests the POSIX branch
+    deterministically regardless of which OS pytest happens to run on, same
+    pattern test_platforms.py already uses."""
+    from raven import platforms
+    monkeypatch.setattr(platforms, "is_windows", lambda: False)
     assert Assistant._confirm_prompt("run_command", {"command": command}) is None
 
 
 @pytest.mark.parametrize("command", UNSAFE_PIPELINE_COMMANDS)
-def test_run_command_pipelines_with_anything_unsafe_still_confirm(command):
+def test_run_command_pipelines_with_anything_unsafe_still_confirm(command, monkeypatch):
+    from raven import platforms
+    monkeypatch.setattr(platforms, "is_windows", lambda: False)
     assert Assistant._confirm_prompt("run_command", {"command": command}) is not None
 
 
@@ -677,6 +688,73 @@ def test_run_tool_cancelled_when_confirmation_denied():
     result = a._run_tool(_call("delete_file", {"path": "/tmp/x"}))
     assert result == "Cancelled by user."
     assert confirms == ["delete file: /tmp/x"]
+
+
+# ---------------------------------------------------------------------------
+# Notification system: an OS notification when R.A.V.E.N needs confirmation
+# or finishes a turn, so the user finds out without watching the window.
+# ---------------------------------------------------------------------------
+
+class _RecordingBackend(platforms.Backend):
+    name = "Recording"
+
+    def __init__(self):
+        self.calls = []
+
+    def notify(self, title, body):
+        self.calls.append((title, body))
+
+
+@pytest.fixture
+def notify_backend():
+    backend = _RecordingBackend()
+    platforms.set_backend(backend)
+    yield backend
+    platforms.set_backend(None)
+
+
+def test_a_confirmation_gated_tool_fires_a_notification_before_asking(notify_backend):
+    order = []
+    a = Assistant(
+        provider=None,
+        confirm_run=lambda action: (order.append("confirmed"), True)[1],
+    )
+    notify_backend.notify = lambda title, body: order.append("notified") or _RecordingBackend.notify(notify_backend, title, body)
+    a._run_tool(_call("delete_file", {"path": "/tmp/x"}))
+    assert order == ["notified", "confirmed"]
+    assert notify_backend.calls == [("R.A.V.E.N needs confirmation", "delete file: /tmp/x")]
+
+
+def test_a_tool_that_never_confirms_never_notifies(notify_backend):
+    a = Assistant(provider=None)
+    a._run_tool(_call("read_file", {"path": "/tmp/x"}))
+    assert notify_backend.calls == []
+
+
+def test_ask_notifies_with_the_reply_once_the_turn_finishes(notify_backend):
+    provider = type("P", (), {"reply": staticmethod(
+        lambda messages, tools=None: {"role": "assistant", "content": "All done."}
+    )})()
+    a = Assistant(provider)
+    assert a.ask("do the thing") == "All done."
+    assert notify_backend.calls == [("R.A.V.E.N", "All done.")]
+
+
+def test_ask_notification_body_collapses_whitespace_and_truncates():
+    long_reply = ("line one\n" * 50) + "end"
+    body = assistant_module._notification_body(long_reply)
+    assert "\n" not in body
+    assert len(body) == assistant_module.NOTIFICATION_BODY_CHARS + 1  # + the "…" marker
+    assert body.endswith("…")
+
+
+def test_ask_does_not_notify_on_an_empty_reply(notify_backend):
+    provider = type("P", (), {"reply": staticmethod(
+        lambda messages, tools=None: {"role": "assistant", "content": ""}
+    )})()
+    a = Assistant(provider)
+    a.ask("do the thing")
+    assert notify_backend.calls == []
 
 
 def test_run_tool_runs_when_confirmation_granted():

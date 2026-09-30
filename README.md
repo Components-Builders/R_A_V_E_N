@@ -70,6 +70,43 @@ macOS Gatekeeper will warn on first launch (code signing needs a paid developer
 certificate). Each OS has to be built on that OS -- the `build-desktop` GitHub Action
 does all three on a tag or a manual run.
 
+### Cancelling a request
+
+The Send button becomes a **Cancel** button while R.A.V.E.N is working. Clicking it
+tells the server to discard whatever answer eventually comes back -- the underlying
+network call can't actually be interrupted mid-flight (it runs on a real background
+thread), so the button shows "Cancelling..." until that call genuinely finishes, at
+which point the half-finished turn is dropped from the conversation (never sent to
+the model on a later turn, never shown), the same "roll back, don't pollute later
+context" behavior the CLI's own `Ctrl+C` already has. The composer stays disabled
+for that whole window, to keep a second message from being sent while the discarded
+one might still be mutating the conversation in the background.
+
+### Message actions: copy, edit, resend
+
+Hovering a message reveals small action links below it. Every message gets
+**Copy** (the raw text, not the rendered markdown, to the clipboard --
+briefly shows "Copied"). A user message additionally gets **Edit** (loads its
+exact text into the composer, so you can change it before sending) and
+**Resend** (sends the exact same text again as a new message). Neither
+touches the existing conversation history -- both always add a NEW message
+rather than replacing or rerunning the old one, so nothing you've already
+sent is ever silently rewritten. Both disable themselves while a request is
+in flight, same guard the Composer's own Send button already has.
+
+### Notifications
+
+R.A.V.E.N sends a native OS notification whenever it needs your confirmation
+(a tool call that's about to do something consequential -- deleting a file,
+running a shell command, etc.) and again whenever it finishes a turn --
+including a reply that's actually a question back to you, since there's no
+separate "needs advice" signal, just a normal reply. This works the same in
+the desktop app and the CLI (one hook, in `Assistant` itself, covers both),
+using `notify-send` on Linux, `osascript` on macOS, and a PowerShell toast on
+Windows -- whichever is available; if none is, notifications are silently
+skipped rather than erroring. A missed notification never blocks or fails
+the actual confirmation/reply it was announcing.
+
 ### Voice mode (push-to-talk)
 
 The desktop app's "Voice" mode (left rail) is a second, independent voice
@@ -172,6 +209,29 @@ same for a git subcommand. The shell-metacharacter check always still
 applies regardless: `"pytest; rm -rf ~"` still confirms even with `pytest`
 trusted — trusting a program name only ever exempts a plain call to exactly
 that program, never anything chained after it.
+
+### `sudo` commands (interactive CLI only)
+
+`run_command`/`run_tests` normally run with stdin closed (`DEVNULL`) so a
+command that tries to read input can't hang the whole session on your real
+terminal — but that also meant a `sudo` command could never actually
+authenticate, since it had no way to read a password even after you approved
+it. In the interactive CLI, a `sudo ...` command first tries non-interactively
+(`sudo -n`), so it never asks for anything if `sudo`'s own cached credential
+(its normal ~15 minute ticket) is still valid; only if that fails because a
+password is actually needed does it ask you for one (masked input, used once,
+never logged, never sent to the model). Approving the command in the usual
+`Allow?` prompt is still required first — this doesn't loosen or skip that;
+it just fixes what happens after you say yes. The actual authenticated
+command gets a generous 5-minute timeout (a real privileged command like a
+package install can easily take longer than a quick shell command), and if
+it does time out, the whole process is killed outright rather than left
+running in the background — an earlier version of this could leave an
+orphaned `sudo` process attached to your terminal, which could then prompt
+for a password on its own, outside R.A.V.E.N's control. Headless mode (`-p`)
+never prompts for a sudo password (no guaranteed terminal to safely ask on),
+so a `sudo` call there fails cleanly exactly as before if it needs one. The
+desktop app doesn't prompt for one either, for the same reason.
 
 ## Hooks
 

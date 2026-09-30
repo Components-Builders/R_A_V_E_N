@@ -204,6 +204,16 @@ def strip_emoji(text: str) -> str:
     return _EMOJI_RE.sub("", text)
 
 
+NOTIFICATION_BODY_CHARS = 200  # OS notification toasts are single-glance, not a place to read a full reply
+
+
+def _notification_body(reply: str) -> str:
+    text = " ".join(reply.split())  # collapse newlines/indentation -- a toast is one line
+    if len(text) <= NOTIFICATION_BODY_CHARS:
+        return text
+    return text[:NOTIFICATION_BODY_CHARS].rstrip() + "…"
+
+
 def _has_shell_metachars(s: str) -> bool:
     return any(c in _SHELL_METACHARS for c in s)
 
@@ -282,6 +292,8 @@ class Assistant:
             if m.get("role") == "assistant" and m.get("reasoning")
         ]
         self._persist()
+        if reply:
+            plat.current().notify("R.A.V.E.N", _notification_body(reply))
         return reply
 
     def _run_turn(self) -> str:
@@ -626,8 +638,10 @@ class Assistant:
             # view, just not a plain tool_impl.py function underneath.
             return self._analyze_image(args.get("path", ""), args.get("question") or "Describe this image.")
         prompt = self._confirm_prompt(name, args, self.allowed_commands, self.allowed_git)
-        if prompt and not self.confirm_run(prompt):
-            return "Cancelled by user."
+        if prompt:
+            plat.current().notify("R.A.V.E.N needs confirmation", prompt)
+            if not self.confirm_run(prompt):
+                return "Cancelled by user."
         func = tool_impl.TOOL_FUNCTIONS.get(name)
         if not func:
             return f"Unknown tool: {name}"

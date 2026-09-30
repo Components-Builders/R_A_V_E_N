@@ -164,11 +164,11 @@ function VoiceStage({ connected, busy, requestTranscribe, onSend }: VoiceStagePr
   // (a <canvas> can't read a CSS variable the way a utility class does, so
   // useEffectiveTheme() resolves 'system' to an actual light/dark literal).
   const COLORS = {
-    light: { ink: '#05080f', danger: '#8a1c1c' },
-    dark: { ink: '#eef0f3', danger: '#e2685f' },
+    light: { still: '#6d6e72', danger: '#8a1c1c', recording: '#05080f' },
+    dark: { still: '#eef0f3', danger: '#e2685f', recording: '' },
   } as const;
   const palette = COLORS[effectiveTheme];
-  const orbColor = phase === 'recording' || phase === 'error' ? palette.danger : palette.ink;
+  const orbColor = phase === 'recording' ? palette.recording : phase === 'error' ? palette.danger : palette.still;
   // "Reduce motion" (Settings): a static frame instead of a continuous spin.
   const orbSpeed = reduceMotion ? 0 : phase === 'recording' ? 2.2 : phase === 'transcribing' || phase === 'opening' ? 1.4 : 0.6;
 

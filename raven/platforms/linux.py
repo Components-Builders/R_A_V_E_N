@@ -176,3 +176,15 @@ class LinuxBackend(Backend):
             _window_calls("Close", str(window_id))
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             raise WindowControlError(str(e)) from e
+
+    def notify(self, title: str, body: str) -> None:
+        if not shutil.which("notify-send"):
+            return
+        try:
+            subprocess.run(
+                ["notify-send", "--app-name=R.A.V.E.N", title, body],
+                timeout=5, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # best-effort -- see Backend.notify

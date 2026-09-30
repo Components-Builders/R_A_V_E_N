@@ -136,6 +136,22 @@ def test_mac_missing_osascript(mac, monkeypatch):
         backend.list_windows()
 
 
+def test_mac_notify_runs_display_notification(mac, monkeypatch):
+    backend, _ = mac
+    r = Runner(_proc("")); monkeypatch.setattr(macos.subprocess, "run", r)
+    backend.notify("R.A.V.E.N", 'needs "confirmation"')
+    assert r.calls[0][0] == [
+        "osascript", "-e",
+        'display notification "needs \\"confirmation\\"" with title "R.A.V.E.N"',
+    ]
+
+
+def test_mac_notify_swallows_a_failure(mac, monkeypatch):
+    backend, _ = mac
+    monkeypatch.setattr(macos.subprocess, "run", Runner(_proc(stderr="boom", returncode=1)))
+    backend.notify("title", "body")  # must not raise -- best-effort
+
+
 # =========================== Windows ========================================
 
 @pytest.fixture
@@ -276,3 +292,28 @@ def test_windows_powershell_failure_and_timeout(win, monkeypatch):
     monkeypatch.setattr(windows.subprocess, "run", slow)
     with pytest.raises(WindowControlError, match="timed out"):
         backend.list_windows()
+
+
+def test_windows_notify_passes_title_and_body_through_env_not_the_script(win, monkeypatch):
+    """Title/body go through env vars (like the shortcut path resolver already
+    does), never spliced into the PowerShell script -- so nothing in a
+    confirmation prompt or reply text can break out of the string."""
+    backend, _ = win
+    r = Runner(_proc("")); monkeypatch.setattr(windows.subprocess, "run", r)
+    backend.notify("title", "body; Remove-Item C:\\")
+    cmd, kwargs = r.calls[0]
+    assert "Remove-Item" not in cmd[-1]
+    assert kwargs["env"]["RAVEN_TITLE"] == "title"
+    assert kwargs["env"]["RAVEN_BODY"] == "body; Remove-Item C:\\"
+
+
+def test_windows_notify_swallows_a_powershell_failure(win, monkeypatch):
+    backend, _ = win
+    monkeypatch.setattr(windows.subprocess, "run", Runner(_proc(stderr="boom", returncode=1)))
+    backend.notify("title", "body")  # must not raise -- best-effort
+
+    def slow(*a, **k):
+        raise subprocess.TimeoutExpired("powershell", 10)
+
+    monkeypatch.setattr(windows.subprocess, "run", slow)
+    backend.notify("title", "body")  # must not raise here either

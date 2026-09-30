@@ -7,6 +7,34 @@ import pytest
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _no_real_desktop_backend():
+    """Assistant.ask()/confirmation calls platforms.current().notify(...) on
+    every turn now (the notification system) -- without this, the FIRST test
+    in the whole suite to hit either path would lazily create and cache a
+    REAL backend, firing actual OS notifications (notify-send, etc.) for the
+    rest of the run on a real Linux/macOS/Windows machine. Defaults every
+    test to an inert backend; a test that wants real backend behavior (e.g.
+    app_dirs) already calls platforms.set_backend(...) itself, which simply
+    overrides this for its own duration."""
+    from raven import platforms
+    platforms.set_backend(platforms.Backend())
+    yield
+    platforms.set_backend(None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sudo_password_provider():
+    """tools._run_sudo consults a module-level provider (raven/cli.py's own
+    interactive registration) -- without resetting it, a test that sets one
+    (to exercise the password-prompt path) would leak it into every test that
+    runs afterward in the same process."""
+    from raven import tools
+    tools.set_sudo_password_provider(None)
+    yield
+    tools.set_sudo_password_provider(None)
+
+
 @pytest.fixture
 def store(tmp_path):
     """A Store backed by a throwaway SQLite file, never the real ~/.raven one."""

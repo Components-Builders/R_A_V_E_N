@@ -34,9 +34,9 @@ import { useApplyTheme, useSettings } from './useSettings';
  */
 export default function App() {
   const {
-    connected, messages, busy, statusText, toolLog, pendingConfirm, error, sessions, currentSession, stats,
+    connected, messages, busy, cancelling, statusText, toolLog, pendingConfirm, error, sessions, currentSession, stats,
     modelConfig, modelsByProvider, modelsLoading, modelsError,
-    ask, respondToConfirm, dismissError, newSession, openSession, deleteSession, requestTranscribe,
+    ask, cancelAsk, respondToConfirm, dismissError, newSession, openSession, deleteSession, requestTranscribe,
     getModelConfig, listModels, setModel,
   } = useRaven();
   const [tab, setTab] = useState<'activity' | 'history'>('activity');
@@ -185,11 +185,13 @@ export default function App() {
         {mode === 'chat' && <ChatStage
           messages={messages}
           busy={busy}
+          cancelling={cancelling}
           statusText={statusText}
           error={error}
           connected={connected}
           pendingConfirm={pendingConfirm}
           onSend={ask}
+          onCancel={cancelAsk}
           onDismissError={dismissError}
         />}
         {mode === 'voice' && <VoiceStage

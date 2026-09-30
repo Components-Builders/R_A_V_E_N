@@ -158,3 +158,26 @@ class WindowsBackend(Backend):
         out = _powershell(f"(Get-Process -Id {pid}).CloseMainWindow()")
         if out.strip().lower() != "true":
             raise WindowControlError("the window did not accept the close request")
+
+    def notify(self, title: str, body: str) -> None:
+        # WinRT toast via PowerShell -- no extra module (e.g. BurntToast) required.
+        # Wrapped in its own try/catch so a missing AUMID registration or an
+        # older Windows build degrades to "nothing shown", not a raised error.
+        script = (
+            "try {"
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
+            "ContentType=WindowsRuntime] | Out-Null;"
+            "$template = [Windows.UI.Notifications.ToastNotificationManager]::"
+            "GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+            "$text = $template.GetElementsByTagName('text');"
+            "$text.Item(0).AppendChild($template.CreateTextNode($env:RAVEN_TITLE)) | Out-Null;"
+            "$text.Item(1).AppendChild($template.CreateTextNode($env:RAVEN_BODY)) | Out-Null;"
+            "$toast = [Windows.UI.Notifications.ToastNotification]::new($template);"
+            "[Windows.UI.Notifications.ToastNotificationManager]::"
+            "CreateToastNotifier('R.A.V.E.N').Show($toast)"
+            "} catch {}"
+        )
+        try:
+            _powershell(script, env_extra={"RAVEN_TITLE": title, "RAVEN_BODY": body}, timeout=10)
+        except WindowControlError:
+            pass  # best-effort -- see Backend.notify

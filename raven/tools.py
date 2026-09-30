@@ -2,10 +2,13 @@
 import difflib
 import html
 import json
+import os
 import re
+import signal
 import subprocess
 import webbrowser
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -267,6 +270,98 @@ RUN_COMMAND_TIMEOUT = 30
 # run_command call to wait that long just to accommodate the rare slow case.
 RUN_TESTS_TIMEOUT = 120
 
+# A command starting with `sudo` (only at the very start -- `foo | sudo tee x`
+# isn't handled, a deliberate, stated scope limit) gets special handling below.
+_SUDO_RE = re.compile(r"^\s*sudo\b")
+
+# A privileged command (package install/upgrade, service restart, ...) can
+# legitimately take far longer than a quick shell command -- same reasoning
+# as RUN_TESTS_TIMEOUT getting its own cap instead of sharing run_command's.
+# This applies to sudo's REAL, authenticated execution, not the `-n` probe
+# below (which either succeeds fast off a cached credential or fails fast).
+RUN_SUDO_TIMEOUT = 300
+
+# CLI-only hook (raven/cli.py registers it; raven/server.py never does) so a
+# sudo command that actually needs a password can get one. Interactive input
+# has no meaning on the desktop server -- there's no terminal the user can see
+# -- so leaving this unset there is deliberate, not an oversight: a sudo call
+# with no cached credential just fails there exactly as it always has (a
+# clean "a password is required" in the tool's own output, not a hang).
+_sudo_password_provider: Callable[[], str | None] | None = None
+
+
+def set_sudo_password_provider(provider: Callable[[], str | None] | None) -> None:
+    """Register (or clear, with None) the callable `_run_sudo` uses to get a
+    sudo password when one turns out to be needed. Returning None/empty from
+    it is treated as "declined" -- the command is not run."""
+    global _sudo_password_provider
+    _sudo_password_provider = provider
+
+
+def _run_capturing_group(command: str, timeout: int, input_text: str | None = None,
+                          stdin=None) -> tuple[str, str, int, bool]:
+    """Like subprocess.run(shell=True, capture_output=True), but kills the
+    WHOLE process group on a timeout, not just the `/bin/sh -c "..."` wrapper.
+
+    subprocess.run's own timeout handling only kills that direct child -- any
+    REAL process it spawned (sudo itself, or whatever sudo is running) is left
+    orphaned but still alive, and critically still attached to OUR controlling
+    terminal. An orphaned sudo that loses its stdin pipe this way can fall
+    back to prompting on the real tty directly, completely outside our
+    control (this is exactly how a timed-out sudo call could end up
+    interleaving its own native password prompt with whatever R.A.V.E.N
+    prints next -- confirmed as the real cause of a live user report, not
+    theoretical). start_new_session puts the whole tree in its own process
+    group so a timeout can take all of it out at once.
+
+    Returns (stdout, stderr, returncode, timed_out)."""
+    proc = subprocess.Popen(
+        command, shell=True, text=True, start_new_session=True,
+        stdin=subprocess.PIPE if input_text is not None else (stdin or subprocess.DEVNULL),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
+        return stdout, stderr, proc.returncode, False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # already gone
+        stdout, stderr = proc.communicate()  # drain what's buffered, now that it's dead
+        return stdout, stderr, proc.returncode, True
+
+
+def _run_sudo(command: str, timeout: int) -> str:
+    """A `sudo ...` command specifically: try it non-interactively first
+    (`sudo -n`) so a command still covered by sudo's own cached credential
+    (its normal ~15 min ticket) never prompts at all -- only ask for a
+    password when sudo itself reports it actually needs one. The password
+    reaches the real subprocess ONLY via its stdin pipe (`input=`, not spliced
+    into the command string or logged/echoed anywhere) and is used once."""
+    probe_command = _SUDO_RE.sub("sudo -n", command, count=1)
+    p_stdout, p_stderr, p_returncode, p_timed_out = _run_capturing_group(probe_command, timeout)
+    if p_timed_out:
+        return f"Timed out after {timeout}s: {command}"
+    needs_password = p_returncode != 0 and "password is required" in (p_stderr or "").lower()
+    if not needs_password or _sudo_password_provider is None:
+        output = p_stdout + p_stderr
+        return _truncate(output.strip()) or f"(exited {p_returncode}, no output)"
+    password = _sudo_password_provider()
+    if not password:
+        return "Cancelled: no sudo password entered."
+    # -p '' suppresses sudo's own "[sudo] password for x:" prompt text --
+    # R.A.V.E.N already asked for it its own way; sudo's copy would just be
+    # noise mixed into the tool's returned output.
+    auth_command = _SUDO_RE.sub("sudo -S -p ''", command, count=1)
+    stdout, stderr, returncode, timed_out = _run_capturing_group(
+        auth_command, RUN_SUDO_TIMEOUT, input_text=password + "\n",
+    )
+    if timed_out:
+        return f"Timed out after {RUN_SUDO_TIMEOUT}s: {command}"
+    output = stdout + stderr
+    return _truncate(output.strip()) or f"(exited {returncode}, no output)"
+
 
 def _run_shell(command: str, timeout: int) -> str:
     # stdin=DEVNULL is load-bearing, not decoration: without it, subprocess.run
@@ -282,7 +377,10 @@ def _run_shell(command: str, timeout: int) -> str:
     # confirmed DEVNULL fixes it in ~5ms instead of blocking for the full
     # timeout). No legitimate run_command/run_tests/git use case needs
     # interactive stdin -- the model can't type into it, so there was never
-    # a good reason to leave this open.
+    # a good reason to leave this open. sudo is the one deliberate exception,
+    # via `_run_sudo` -- see its own docstring and `set_sudo_password_provider`.
+    if _SUDO_RE.match(command):
+        return _run_sudo(command, timeout)
     result = subprocess.run(
         command, shell=True, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
     )

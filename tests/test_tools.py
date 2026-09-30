@@ -4,6 +4,7 @@ App-matching tests use the `app_dirs` fixture (a fabricated .desktop
 directory), never the real machine's installed apps — otherwise this suite
 would only pass on whichever machine wrote it.
 """
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -97,6 +98,38 @@ def test_binary_name_non_flatpak_app(app_dirs):
 
 def test_binary_name_unknown_app_id(app_dirs):
     assert linux._binary_name("no-such-app") is None
+
+
+# ---------------------------------------------------------------------------
+# LinuxBackend.notify: the notification system (confirm/finished-task alerts)
+# ---------------------------------------------------------------------------
+
+def test_linux_notify_calls_notify_send(monkeypatch):
+    calls = []
+    monkeypatch.setattr(linux.shutil, "which", lambda name: "/usr/bin/notify-send")
+    monkeypatch.setattr(linux.subprocess, "run", lambda cmd, **k: calls.append(cmd))
+    linux.LinuxBackend().notify("R.A.V.E.N", "hello")
+    assert calls == [["notify-send", "--app-name=R.A.V.E.N", "R.A.V.E.N", "hello"]]
+
+
+def test_linux_notify_is_a_silent_no_op_without_notify_send(monkeypatch):
+    monkeypatch.setattr(linux.shutil, "which", lambda name: None)
+
+    def boom(*a, **k):
+        raise AssertionError("should never call subprocess.run without notify-send")
+
+    monkeypatch.setattr(linux.subprocess, "run", boom)
+    linux.LinuxBackend().notify("title", "body")  # must not raise
+
+
+def test_linux_notify_swallows_a_subprocess_failure(monkeypatch):
+    monkeypatch.setattr(linux.shutil, "which", lambda name: "/usr/bin/notify-send")
+
+    def boom(*a, **k):
+        raise OSError("no dbus session")
+
+    monkeypatch.setattr(linux.subprocess, "run", boom)
+    linux.LinuxBackend().notify("title", "body")  # must not raise -- best-effort
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +570,161 @@ def test_run_command_and_run_tests_and_git_all_pass_stdin_devnull(monkeypatch):
     tools.run_tests()
     tools.git("status")
     assert calls == [tools.subprocess.DEVNULL] * 3
+
+
+# ---------------------------------------------------------------------------
+# sudo: the one deliberate exception to the stdin=DEVNULL rule above. A real
+# fix for a real gap -- sudo could never authenticate before this (DEVNULL
+# means it can never read a password), so an interactive CLI user approving a
+# sudo call via confirm_run just watched it fail afterward with no way to
+# actually supply the password it needed.
+# ---------------------------------------------------------------------------
+
+class _FakeProc:
+    """Stands in for a subprocess.Popen handle -- _run_capturing_group only
+    ever calls .communicate()/.returncode/.pid on what Popen(...) gives it."""
+    def __init__(self, stdout="", stderr="", returncode=0, hangs=False):
+        self._stdout, self._stderr, self.returncode = stdout, stderr, returncode
+        self._hangs = hangs
+        self.pid = 4242
+        self.killed = False
+
+    def communicate(self, input=None, timeout=None):
+        if self._hangs and not self.killed:
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+        return self._stdout, self._stderr
+
+
+def _fake_popen(procs):
+    """Returns a stand-in for subprocess.Popen that hands back `procs` in
+    order, recording each call's (command, kwargs)."""
+    calls = []
+    queue = list(procs)
+
+    def popen(command, **kwargs):
+        calls.append((command, kwargs))
+        return queue.pop(0)
+
+    popen.calls = calls
+    return popen
+
+
+def test_sudo_with_a_cached_credential_never_asks_for_a_password(monkeypatch):
+    """sudo -n succeeds immediately when sudo's own ~15 min ticket is still
+    valid -- the password provider must never even be consulted in that case."""
+    fake = _fake_popen([_FakeProc(stdout="ok\n", returncode=0)])
+    monkeypatch.setattr(tools.subprocess, "Popen", fake)
+    provider_calls = []
+    tools.set_sudo_password_provider(lambda: provider_calls.append(1) or "hunter2")
+
+    assert tools.run_command("sudo apt update").strip() == "ok"
+    assert len(fake.calls) == 1
+    command, kwargs = fake.calls[0]
+    assert command == "sudo -n apt update"
+    assert kwargs["stdin"] == tools.subprocess.DEVNULL
+    assert kwargs["start_new_session"] is True
+    assert provider_calls == []  # never asked
+
+
+def test_sudo_without_a_cached_credential_asks_for_and_uses_the_password(monkeypatch):
+    fake = _fake_popen([
+        _FakeProc(stderr="sudo: a password is required", returncode=1),
+        _FakeProc(stdout="updated\n", returncode=0),
+    ])
+    monkeypatch.setattr(tools.subprocess, "Popen", fake)
+    tools.set_sudo_password_provider(lambda: "hunter2")
+
+    assert tools.run_command("sudo apt update").strip() == "updated"
+    assert len(fake.calls) == 2
+    probe_cmd, probe_kwargs = fake.calls[0]
+    auth_cmd, auth_kwargs = fake.calls[1]
+    assert probe_cmd == "sudo -n apt update"
+    assert auth_cmd == "sudo -S -p '' apt update"
+    # The password reaches the real process ONLY via communicate()'s input,
+    # never the command string (where it'd show up in a process list / this
+    # tool's own returned output) and never a plain stdin=DEVNULL (which
+    # would just repeat the original bug).
+    assert auth_kwargs["stdin"] == tools.subprocess.PIPE
+    assert "hunter2" not in auth_cmd
+    assert auth_kwargs["start_new_session"] is True
+
+
+def test_sudo_uses_a_generous_timeout_for_the_real_authenticated_command(monkeypatch):
+    """RUN_COMMAND_TIMEOUT (30s) is fine for the instant -n probe, but a real
+    privileged command (a package install, say) can easily run past it --
+    the REAL authenticated call gets its own, much longer cap."""
+    timeouts = []
+    real_communicate = _FakeProc.communicate
+
+    def spying_communicate(self, input=None, timeout=None):
+        timeouts.append(timeout)
+        return real_communicate(self, input=input, timeout=timeout)
+
+    monkeypatch.setattr(_FakeProc, "communicate", spying_communicate, raising=False)
+    fake = _fake_popen([
+        _FakeProc(stderr="sudo: a password is required", returncode=1),
+        _FakeProc(returncode=0),
+    ])
+    monkeypatch.setattr(tools.subprocess, "Popen", fake)
+    tools.set_sudo_password_provider(lambda: "hunter2")
+
+    tools.run_command("sudo apt update")  # RUN_COMMAND_TIMEOUT=30 passed in
+    assert timeouts == [tools.RUN_COMMAND_TIMEOUT, tools.RUN_SUDO_TIMEOUT]
+    assert tools.RUN_SUDO_TIMEOUT > tools.RUN_COMMAND_TIMEOUT
+
+
+def test_sudo_kills_the_whole_process_group_on_a_timeout_not_just_the_shell(monkeypatch):
+    """The real bug this guards against: subprocess.run's own timeout only
+    kills the `/bin/sh -c "..."` wrapper, leaving a real child (sudo itself,
+    or whatever it's running) orphaned but still attached to the real
+    terminal -- which is how an orphaned sudo ended up nattively prompting on
+    a live user's terminal, completely outside R.A.V.E.N's control."""
+    killed_pgids = []
+    hanging = _FakeProc(hangs=True)
+
+    def fake_killpg(pgid, sig):
+        killed_pgids.append((pgid, sig))
+        hanging.killed = True  # real os.killpg would let the drained communicate() return
+
+    monkeypatch.setattr(tools.os, "killpg", fake_killpg)
+    monkeypatch.setattr(tools.os, "getpgid", lambda pid: pid)
+    fake = _fake_popen([hanging])
+    monkeypatch.setattr(tools.subprocess, "Popen", fake)
+
+    result = tools.run_command("sudo apt update")
+    assert "Timed out" in result
+    assert killed_pgids == [(hanging.pid, tools.signal.SIGKILL)]
+
+
+def test_sudo_declining_the_password_prompt_never_runs_the_command(monkeypatch):
+    fake = _fake_popen([_FakeProc(stderr="sudo: a password is required", returncode=1)])
+    monkeypatch.setattr(tools.subprocess, "Popen", fake)
+    tools.set_sudo_password_provider(lambda: None)  # Enter with no input -- declined
+
+    assert tools.run_command("sudo apt update") == "Cancelled: no sudo password entered."
+    assert len(fake.calls) == 1  # only the probe -- never the real command
+    assert fake.calls[0][0] == "sudo -n apt update"
+
+
+def test_sudo_with_no_registered_provider_fails_exactly_like_before(monkeypatch):
+    """The desktop server never registers a provider (see
+    set_sudo_password_provider's docstring) -- a sudo call there must keep
+    failing cleanly, not hang or newly start prompting for anything."""
+    fake = _fake_popen([_FakeProc(stderr="sudo: a password is required", returncode=1)])
+    monkeypatch.setattr(tools.subprocess, "Popen", fake)
+    assert tools.run_command("sudo apt update") == "sudo: a password is required"
+    assert len(fake.calls) == 1  # never even tries the password path
+
+
+def test_a_command_that_merely_mentions_sudo_is_not_treated_as_one(monkeypatch):
+    """`_SUDO_RE` only matches sudo as the command's own first word -- a
+    command that merely contains the word (in a pipeline, as an argument,
+    inside a string) must go through the ordinary DEVNULL path unchanged."""
+    def boom(*a, **k):
+        raise AssertionError("should never take the sudo path")
+
+    monkeypatch.setattr(tools, "_run_sudo", boom)
+    assert tools.run_command("echo 'ask for sudo later'").strip() == "ask for sudo later"
 
 
 # ---------------------------------------------------------------------------

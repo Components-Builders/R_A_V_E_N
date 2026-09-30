@@ -145,3 +145,10 @@ class MacBackend(Backend):
             f'click (first button of window "{_as_string(title)}" whose subrole is "AXCloseButton")'
         )
         _osascript(script)
+
+    def notify(self, title: str, body: str) -> None:
+        script = f'display notification "{_as_string(body)}" with title "{_as_string(title)}"'
+        try:
+            _osascript(script, timeout=5)
+        except WindowControlError:
+            pass  # best-effort -- see Backend.notify

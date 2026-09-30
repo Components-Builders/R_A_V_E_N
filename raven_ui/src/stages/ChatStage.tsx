@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import logo from '../../src/assets/logo.png'
 import Composer from '../../src/ui/Composer';
 import MessageBubble from '../../src/ui/MessageBubble';
@@ -7,18 +7,28 @@ import { Message, PendingConfirm } from 'src/useRaven';
 interface ChatStageProps {
     messages: Message[];
     busy: boolean;
+    cancelling: boolean;
     statusText: string | null;
     error: string | null;
     connected: boolean;
     pendingConfirm: PendingConfirm | null;
     onSend: (text: string) => void;
+    onCancel: () => void;
     onDismissError: () => void;
 }
 
 const ChatStage = ({
-    messages, busy, statusText, error, connected, pendingConfirm, onSend, onDismissError,
+    messages, busy, cancelling, statusText, error, connected, pendingConfirm, onSend, onCancel, onDismissError,
 }: ChatStageProps) => {
     const endRef = useRef<HTMLDivElement>(null);
+    // A message bubble's "Edit" click loads its text here; Composer applies
+    // it via its `prefill` prop. Local to this stage -- nothing outside the
+    // composer needs to know a prompt is being edited.
+    const [draft, setDraft] = useState<{ text: string; token: number } | null>(null);
+    const draftToken = useRef(0);
+    const editPrompt = useCallback((text: string) => {
+        setDraft({ text, token: ++draftToken.current });
+    }, []);
 
     useEffect(() => {
         endRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -33,7 +43,9 @@ const ChatStage = ({
                         <span>Ask anything.</span>
                     </div>
                 ) : (
-                    messages.map((m, i) => <MessageBubble key={i} m={m} />)
+                    messages.map((m, i) => (
+                        <MessageBubble key={i} m={m} disabled={busy} onResend={onSend} onEdit={editPrompt} />
+                    ))
                 )}
                 {busy && statusText && <div className="self-start text-[0.82rem] text-ink-dim">{statusText}</div>}
                 {error && (
@@ -47,7 +59,15 @@ const ChatStage = ({
                 <div ref={endRef} />
             </div>
 
-            <Composer connected={connected} busy={busy} blocked={!!pendingConfirm} onSend={onSend} />
+            <Composer
+                connected={connected}
+                busy={busy}
+                cancelling={cancelling}
+                blocked={!!pendingConfirm}
+                prefill={draft}
+                onSend={onSend}
+                onCancel={onCancel}
+            />
         </main>
     )
 }

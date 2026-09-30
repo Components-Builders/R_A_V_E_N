@@ -319,6 +319,81 @@ commands on any OS. The desktop app (`raven_ui/`) starts the Python server itsel
 Linux deb+rpm). Only the Linux build has been exercised; installers are unsigned and the
 app still requires Python with the package installed. Details: README "Setup" and "Desktop app".
 
+### Cancelling a request (Step 3.69)
+
+The Composer's Send button becomes a **Cancel** button while a request is in flight
+(`raven/server.py`'s `cancel_ask` message). The underlying network call runs on a real
+background thread and can't be forcibly stopped, so cancelling doesn't abort it --
+instead the server marks that specific call's `_AskToken` cancelled, acknowledges
+immediately (`cancel_requested`; UI shows "Cancelling..."), and once the call genuinely
+finishes, rolls the turn back out of `Assistant.history` (so it's never sent to the
+model or shown) and reports `cancelled`. Mirrors the CLI's own `Ctrl+C` semantics
+("the half-finished turn is rolled back") as closely as a background-thread design
+allows. A second `ask` is refused with a clear error until the current one -- cancelled
+or not -- actually settles, preventing two turns from mutating history at once.
+**Known limitation:** `Assistant.ask()` persists the turn to the SQLite store before
+`_run_ask` ever learns it was cancelled, so the discarded turn is rolled back from the
+live, in-memory conversation (correct for the rest of this session) but still exists on
+disk -- a full app restart afterward would load it back. Not fixed; would need a new
+`Store` method to delete specific rows after the fact.
+
+### Message actions: copy, edit, resend (Step 3.72)
+
+`MessageBubble.tsx`: every bubble gets a hover-revealed action row (`hidden group-hover:flex`,
+same reveal pattern the sidebar's per-chat delete button already uses, so it never reserves
+layout space while not hovered). **Copy** (the raw source text, not the rendered markdown) is
+available on both roles; it briefly swaps its own label to "Copied" (a local `copied` state,
+reset after 1.5s) instead of a toast. User messages only also get **Edit** and **Resend**, both
+disabled while `busy` (mirrors Composer's own Send-button guard, since either would otherwise
+race an in-flight turn -- `raven/server.py`'s `_AskToken` single-flight check would just refuse
+it with an error, but disabling the buttons avoids that round trip entirely).
+- **Copy's actual implementation (Step 3.75)**: NOT the plain Web `navigator.clipboard` API --
+  Electron denies the `clipboard-write` permission to web content by default, and even a
+  preload-based `require('electron').clipboard` call turned out not to be reliably available
+  from inside preload's own copy of the `electron` module. `copy()` calls
+  `window.electronClipboard.writeText(text)` (async, awaited -- see `src/electron.d.ts` for the
+  exposed shape), which `preload.ts` relays via `ipcRenderer.invoke('clipboard:writeText', ...)`
+  to a handler in `main.ts` that calls the real `clipboard` module from the (never sandboxed)
+  main process. `setPermissionRequestHandler` in `main.ts` also now approves
+  `clipboard-read`/`clipboard-sanitized-write` (alongside the existing `media` for voice), so
+  the plain Web API works too if anything ever calls it directly.
+- **Resend** calls the SAME `onSend`/`ask` callback the Composer's own Send button uses, with
+  the message's exact text -- appends a new user message and lets the model answer again. It
+  does NOT truncate or replace history: the original message and its original reply both stay,
+  and the resend becomes new messages at the end, same as if you'd typed it again yourself.
+- **Edit** loads the text into the Composer via a new `prefill` prop (`{text, token}` --
+  the incrementing `token` forces the effect to re-fire even if the same message is edited
+  twice in a row, since a plain string prop wouldn't change) instead of sending anything;
+  the user reviews/changes it and sends normally. `draft` state lives in `ChatStage` itself,
+  local to that stage -- neither `useRaven.ts` nor `App.tsx` needed to change.
+- No backend changes at all -- this is a purely client-side feature built entirely from
+  primitives the UI already had (the same `ask` callback, `useRaven`'s existing history).
+- verified live in a real headless-Chromium run (a scripted fake `WebSocket`, no real server):
+  Resend sends exactly `{"type":"ask","text":"<original>"}`; Edit loads the exact text into the
+  textarea; both Edit and Resend correctly disable themselves once an `ask` is in flight; the
+  assistant's own bubble has Copy but never Edit/Resend. Copy itself is verified separately,
+  live, against the REAL Electron app (Step 3.75) -- the fake-`WebSocket` browser run above
+  can't exercise `window.electronClipboard` at all, since that only exists inside a real
+  Electron preload context.
+
+### Notifications (Step 3.71)
+
+A native OS notification fires from two places in `Assistant` itself (`raven/assistant.py`),
+so the CLI and the desktop server both get it for free from one hook instead of two:
+`_run_tool` notifies ("R.A.V.E.N needs confirmation", the exact confirmation prompt) right
+before calling `confirm_run`, and `ask()` notifies ("R.A.V.E.N", the reply text -- collapsed
+to one line, truncated at 200 chars) once a turn produces a non-empty reply. There's no
+separate "needs advice" signal -- a reply that's actually a question back to the user still
+arrives as a normal `ask()` reply, so it's covered by the same notification; the body text is
+what tells the two apart. A tool that never needs confirmation never notifies; an empty reply
+never notifies. Delivered via `raven/platforms`' existing OS-abstraction (`Backend.notify`),
+same pattern as the app/window-control tools: `notify-send` on Linux, `osascript` on macOS, a
+PowerShell WinRT toast on Windows. Unlike every other `Backend` method, `notify` never raises
+and returns nothing -- each OS implementation swallows its own failure (missing binary,
+subprocess error, timeout) internally, since a missed notification must never break the
+confirmation/reply it was announcing. macOS/Windows are unconfirmed on real hardware, same
+honest posture as the rest of `platforms/` (Step 3.57).
+
 ---
 
 ## Skills (D2)
@@ -389,6 +464,79 @@ in prose first, since the prompt already exists.
 - **Prompt-injection defence is instruction-only.** The model is told that web
   page content and email content are data, never instructions. The
   confirmation prompts above are the hard backstop for anything consequential.
+
+### `sudo` inside `run_command`/`run_tests` (Step 3.73)
+
+The confirmation policy above is unchanged by this -- a `sudo` command still
+needs the same `Allow?` approval as any other `run_command` call. What
+changed is what happens AFTER approval: `run_command`/`run_tests` normally run
+with `stdin=subprocess.DEVNULL` (deliberate, see the comment at `tools._run_shell`
+-- without it, an interactive command inherits R.A.V.E.N's real terminal and
+can hang unrecoverably), which meant `sudo` could never actually read a
+password, so an approved `sudo` call just failed afterward with no way to
+supply what it needed.
+
+`tools._run_sudo` (only entered when the command's first word is literally
+`sudo`, via `_SUDO_RE`) tries `sudo -n <rest>` first -- succeeds immediately,
+asks for nothing, if `sudo`'s own cached credential (~15 min ticket) is still
+valid. Only if that specifically fails with "a password is required" does it
+consult `tools._sudo_password_provider` (a module-level hook, `None` by
+default) for a password, then retries as `sudo -S -p '' <rest>` with the
+password piped through the real subprocess's stdin -- never spliced into the
+command string (would leak into a process listing and this tool's own
+returned output) and never logged. `raven/cli.py`'s interactive `main()` is
+the ONLY thing that ever registers a provider (`sudo_password_prompt`, a thin
+`getpass.getpass()` wrapper with the same Status-spinner pause/resume dance
+`confirm_run` already does) -- `run_headless` (`-p`/`-y`) and `raven/server.py`
+(the desktop app) never do, since neither has a terminal it's safe to
+interactively prompt on; a `sudo` call there fails exactly as it always has
+(a clean "a password is required" in the tool's own output, never a hang).
+Declining the password prompt (Enter/Ctrl+C/Ctrl+D) returns "Cancelled: no
+sudo password entered." without ever running the real command.
+
+Both the probe and the real authenticated call run through `tools._run_capturing_group`
+(`subprocess.Popen(..., start_new_session=True)` + `.communicate()`) rather than
+plain `subprocess.run`, specifically so a timeout kills the WHOLE process group,
+not just the `/bin/sh -c "..."` wrapper -- see Step 3.74: a real privileged
+command (an install, an upgrade) can run past a short timeout, and an orphaned
+`sudo` left attached to R.A.V.E.N's own controlling terminal can fall back to
+prompting there directly, outside any of this code's control. The real,
+authenticated call gets its own, much longer `RUN_SUDO_TIMEOUT` (300s) for the
+same reason `run_tests` gets a longer cap than `run_command` -- the `-n` probe
+keeps whatever timeout its caller (`run_command`/`run_tests`) was given, since
+it always resolves near-instantly either way.
+- verified: 6 new `tools.py` tests (cached-credential case never asks;
+  no-cached-credential case asks and the password reaches the real process
+  only via `input=`, never the command string or `stdin=`; declining runs
+  nothing; no registered provider fails exactly like before; a command that
+  merely mentions "sudo" without starting with it is untouched), 6 new
+  `cli.py` tests for `sudo_password_prompt` (returns what `getpass` returns;
+  empty/Ctrl+C/Ctrl+D all mean declined; the Status spinner is paused and
+  resumed around the prompt, including when declined; `run_headless` never
+  registers a provider). Live-verified on this real machine: the real `sudo`
+  binary's actual stderr text ("sudo: a password is required") matches what
+  the detection checks for exactly; the real `sudo -S -p '' true` mechanics
+  (password via `input=`) confirmed end-to-end with a deliberately WRONG
+  password (never a real one) -- "Sorry, try again." / "1 incorrect password
+  attempt" proves the piped password genuinely reached sudo's own auth check,
+  not just that the command ran. Step 3.74 additionally proved, live, that
+  the OLD plain-`subprocess.run` version left a real orphaned process behind
+  on a timeout (`pgrep` found it, PID confirmed) while the current
+  `_run_capturing_group`-based version does not, for the same shape of
+  command. Full suite: 545 passed.
+- not done: a command where `sudo` isn't the very first word (a pipeline like
+  `foo | sudo tee /etc/x`, or `sudo` after `&&`) isn't detected -- stated
+  scope limit, same "only the plain, common case" posture `_is_safe_command`'s
+  own SAFE_COMMANDS matching already has elsewhere in this file. A wrong
+  password can show a slightly noisy combined message (`sudo -S`'s own retry
+  reads EOF on its second attempt, since the pipe only ever supplies one line)
+  -- still clearly reports failure, just not the cleanest possible wording;
+  not fixed since it doesn't affect correctness. The general, non-sudo
+  `run_command`/`run_tests` path still uses plain `subprocess.run` (only
+  wrapper-level timeout killing) -- the same theoretical orphan risk exists
+  there for a long-running compound command, but nothing else in that path
+  can hijack the real terminal the way an orphaned `sudo` can, so it wasn't
+  changed.
 
 ---
 

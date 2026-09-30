@@ -46,6 +46,9 @@ class FakeBackend(Backend):
     def close_window(self, window_id):
         self.calls.append(("close_window", window_id))
 
+    def notify(self, title, body):
+        self.calls.append(("notify", title, body))
+
 
 # --- backend selection -------------------------------------------------------
 
@@ -53,6 +56,10 @@ def test_current_picks_linux_backend_on_linux(monkeypatch):
     monkeypatch.setattr("sys.platform", "linux")
     platforms.set_backend(None)
     assert platforms.current().name == "Linux"
+
+
+def test_base_backend_notify_is_a_silent_no_op():
+    Backend().notify("title", "body")  # must not raise, nothing to assert on
 
 
 @pytest.mark.parametrize("plat,name", [("win32", "Windows"), ("darwin", "macOS")])

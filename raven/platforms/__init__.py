@@ -50,6 +50,13 @@ class Backend:
         """Close exactly one window by id. Raises WindowControlError."""
         raise WindowControlError(f"window control isn't supported on {self.name} yet")
 
+    def notify(self, title: str, body: str) -> None:
+        """Show a native OS notification. Best-effort: unlike the methods
+        above, callers don't check a return value or catch an exception from
+        this -- a missed notification should never break the actual work
+        (a confirmation prompt, a finished reply) it's just announcing.
+        The base implementation is a no-op for an unrecognized OS."""
+
 
 def is_windows() -> bool:
     return sys.platform.startswith("win")

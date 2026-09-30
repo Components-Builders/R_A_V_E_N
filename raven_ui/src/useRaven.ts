@@ -24,7 +24,9 @@ type ServerMessage =
   | { type: 'transcript_error'; id: string; message: string }
   | { type: 'model_config'; provider: string; name: string }
   | { type: 'models'; provider: string; items: string[] }
-  | { type: 'models_error'; provider: string; message: string };
+  | { type: 'models_error'; provider: string; message: string }
+  | { type: 'cancel_requested' }
+  | { type: 'cancelled' };
 
 export type StatSegment = { name: string; text: string };
 export type ModelConfig = { provider: string; name: string };
@@ -65,6 +67,13 @@ export function useRaven() {
   const [connected, setConnected] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [busy, setBusy] = useState(false); // an ask is in flight
+  // True from the moment cancel_ask is sent until the server confirms the
+  // turn actually settled ("cancelled") -- the underlying call can't be
+  // forcibly stopped (raven/server.py's _AskToken), so it keeps running in
+  // the background for however long it takes; this just distinguishes
+  // "waiting for a reply" from "waiting for a cancelled reply to be discarded"
+  // in the UI. busy stays true the whole time either way -- see cancelAsk().
+  const [cancelling, setCancelling] = useState(false);
   const [statusText, setStatusText] = useState<string | null>(null);
   const [toolStatus, setToolStatus] = useState<string | null>(null);
   const [stats, setStats] = useState<StatSegment[]>([]);
@@ -91,6 +100,10 @@ export function useRaven() {
       setStatusText(null);
       return;
     }
+    if (cancelling) {
+      setStatusText('Cancelling...');
+      return;
+    }
     if (toolStatus) {
       setStatusText(toolStatus);
       return;
@@ -99,7 +112,7 @@ export function useRaven() {
     setStatusText(pick());
     const id = setInterval(() => setStatusText(pick()), 5000);
     return () => clearInterval(id);
-  }, [busy, toolStatus]);
+  }, [busy, toolStatus, cancelling]);
 
   useEffect(() => {
     let disposed = false;
@@ -122,6 +135,7 @@ export function useRaven() {
         setConnected(false);
         // Whatever was in flight can never complete on a dead socket -- don't leave the UI "thinking" forever.
         setBusy(false);
+        setCancelling(false);
         setToolStatus(null);
         setPendingConfirm(null);
         setStats([]);
@@ -159,6 +173,7 @@ export function useRaven() {
             break;
           case 'reply':
             setBusy(false);
+            setCancelling(false);
             setToolStatus(null);
             setMessages((m) => [...m, { role: 'raven', text: data.text }]);
             break;
@@ -198,8 +213,17 @@ export function useRaven() {
           case 'confirm_request':
             setPendingConfirm({ id: data.id, prompt: data.prompt });
             break;
+          case 'cancel_requested':
+            setCancelling(true);
+            break;
+          case 'cancelled':
+            setBusy(false);
+            setCancelling(false);
+            setToolStatus(null);
+            break;
           case 'error':
             setBusy(false);
+            setCancelling(false);
             setToolStatus(null);
             setError(data.message);
             break;
@@ -242,6 +266,21 @@ export function useRaven() {
   );
 
   const dismissError = useCallback(() => setError(null), []);
+
+  /**
+   * Cancel the in-flight ask(), if any. The underlying call can't actually be
+   * stopped (see server.py's _AskToken) -- this just tells the server to
+   * discard whatever it eventually returns, and switches the UI from
+   * "Thinking" to "Cancelling..." until that settles ("cancelled" comes
+   * back). Composer stays disabled the whole time: allowing a new message
+   * before the old one truly settles would risk two turns mutating history
+   * at once.
+   */
+  const cancelAsk = useCallback(() => {
+    const ws = wsRef.current;
+    if (!busy || cancelling || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'cancel_ask' }));
+  }, [busy, cancelling]);
 
   /**
    * Send captured audio (16-bit PCM, little-endian, mono, base64-encoded --
@@ -294,9 +333,9 @@ export function useRaven() {
   );
 
   return {
-    connected, messages, busy, statusText, toolLog, pendingConfirm, error, sessions, currentSession, stats,
+    connected, messages, busy, cancelling, statusText, toolLog, pendingConfirm, error, sessions, currentSession, stats,
     modelConfig, modelsByProvider, modelsLoading, modelsError,
-    ask, respondToConfirm, dismissError, newSession, openSession, deleteSession, requestTranscribe,
+    ask, cancelAsk, respondToConfirm, dismissError, newSession, openSession, deleteSession, requestTranscribe,
     getModelConfig, listModels, setModel,
   };
 }

@@ -490,3 +490,58 @@ def test_build_assistant_uses_nvidia_when_settings_json_says_so(settings_path):
         api_key="nv-key", model="meta/llama-3.1-8b-instruct", fallbacks=DEFAULT_SETTINGS["model"]["fallbacks"],
     )
     assert provider is MockNvidia.return_value
+
+
+# ---------------------------------------------------------------------------
+# sudo_password_prompt: the CLI-only password provider tools._run_sudo calls
+# ---------------------------------------------------------------------------
+
+def test_sudo_password_prompt_returns_what_getpass_returns():
+    with patch.object(cli.getpass, "getpass", return_value="hunter2") as mock_getpass:
+        assert cli.sudo_password_prompt() == "hunter2"
+    mock_getpass.assert_called_once()
+
+
+def test_sudo_password_prompt_treats_an_empty_answer_as_declined():
+    with patch.object(cli.getpass, "getpass", return_value=""):
+        assert cli.sudo_password_prompt() is None
+
+
+def test_sudo_password_prompt_treats_ctrl_c_and_ctrl_d_as_declined():
+    with patch.object(cli.getpass, "getpass", side_effect=KeyboardInterrupt):
+        assert cli.sudo_password_prompt() is None
+    with patch.object(cli.getpass, "getpass", side_effect=EOFError):
+        assert cli.sudo_password_prompt() is None
+
+
+def test_sudo_password_prompt_pauses_and_resumes_the_status_spinner():
+    """Same reason confirm_run does this: a Status spinner's Live render
+    would otherwise paint over (or garble) an interactive prompt."""
+    order = []
+    fake_status = type("S", (), {
+        "stop": lambda self: order.append("stop"),
+        "start": lambda self: order.append("start"),
+    })()
+    with patch.object(cli.getpass, "getpass", side_effect=lambda *a: order.append("prompt") or "hunter2"):
+        cli.sudo_password_prompt(fake_status)
+    assert order == ["stop", "prompt", "start"]
+
+
+def test_sudo_password_prompt_resumes_the_spinner_even_if_declined():
+    order = []
+    fake_status = type("S", (), {
+        "stop": lambda self: order.append("stop"),
+        "start": lambda self: order.append("start"),
+    })()
+    with patch.object(cli.getpass, "getpass", side_effect=KeyboardInterrupt):
+        cli.sudo_password_prompt(fake_status)
+    assert order == ["stop", "start"]
+
+
+def test_run_headless_never_registers_a_sudo_password_provider():
+    """run_headless (the -p/--yes path) must NOT register one -- there's no
+    guaranteed TTY there, and prompting would break its scriptability."""
+    tools.set_sudo_password_provider(None)
+    with patch.object(cli, "build_assistant", return_value=(_FakeHeadlessAssistant("ok"), None)):
+        cli.run_headless("hi", auto_confirm=True)
+    assert tools._sudo_password_provider is None

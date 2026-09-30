@@ -72,7 +72,15 @@ def test_build_system_prompt_appends_to_the_base_persona(tmp_path):
     assert "PROJECT_MARKER" in prompt
 
 
-def test_build_system_prompt_with_no_rules_files_is_just_the_base_persona(tmp_path):
+def test_build_system_prompt_with_no_rules_files_is_just_the_base_persona(tmp_path, monkeypatch):
+    """Found via real CI (Windows): this asserted exact equality with no OS
+    note, but _os_note() genuinely detects Windows/macOS when actually running
+    ON one -- forcing "Linux" here makes the assertion OS-independent, same
+    as test_platforms.py's own pattern for exercising one OS deterministically
+    regardless of which OS pytest happens to run on."""
+    from raven import platforms
+    monkeypatch.setattr(platforms, "is_windows", lambda: False)
+    monkeypatch.setattr(platforms, "is_macos", lambda: False)
     prompt = build_system_prompt(cwd=tmp_path, home=tmp_path / "empty_home", notes_path=tmp_path / "no_notes.md")
     assert prompt == llm_provider.SYSTEM_PROMPT
 
@@ -382,6 +390,71 @@ def test_nvidia_an_ordinary_404_is_not_mistaken_for_the_not_enabled_case(monkeyp
     provider = NvidiaProvider(api_key="k", model="some/model", system_prompt="SYS")
     monkeypatch.setattr(provider._session, "post", lambda **kw: _FakeResponse(404, text="404 page not found"))
     with pytest.raises(RuntimeError, match="^NVIDIA 404: 404 page not found$"):
+        provider.reply([{"role": "user", "content": "hi"}])
+
+
+# ---------------------------------------------------------------------------
+# Timeouts/connection failures: found live (2026-09-28) -- these leaked the
+# raw requests/urllib3 exception text straight into the UI's error banner
+# ("HTTPSConnectionPool(host='integrate.api.nvidia.com', port=443): Read
+# timed out. (read timeout=60)"), which tells a user nothing actionable.
+# ---------------------------------------------------------------------------
+
+def _raise(exc):
+    def _fn(**kw):
+        raise exc
+    return _fn
+
+
+def test_nvidia_a_read_timeout_is_translated_to_a_clear_actionable_message(monkeypatch):
+    import requests as real_requests
+    provider = NvidiaProvider(api_key="k", model="some/model", system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", _raise(real_requests.exceptions.ReadTimeout("Read timed out. (read timeout=60)")))
+    with pytest.raises(RuntimeError, match="didn't respond within 60s"):
+        provider.reply([{"role": "user", "content": "hi"}])
+
+
+def test_nvidia_a_connection_error_is_translated_clearly(monkeypatch):
+    import requests as real_requests
+    provider = NvidiaProvider(api_key="k", model="some/model", system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", _raise(real_requests.exceptions.ConnectionError("no route to host")))
+    with pytest.raises(RuntimeError, match="Couldn't reach NVIDIA"):
+        provider.reply([{"role": "user", "content": "hi"}])
+
+
+def test_nvidia_a_timeout_on_the_primary_still_falls_back(monkeypatch):
+    """The translated RuntimeError must still be an ordinary exception
+    _post_with_fallback can catch and move past, same as any other failure."""
+    import requests as real_requests
+    calls = []
+
+    def fake_post(url, headers, json, timeout):
+        calls.append(json["model"])
+        if json["model"] == "primary":
+            raise real_requests.exceptions.ReadTimeout("Read timed out.")
+        return _chat_response(model=json["model"])
+
+    provider = NvidiaProvider(api_key="k", model="primary", fallbacks=["backup"], system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", fake_post)
+    result = provider.reply([{"role": "user", "content": "hi"}])
+
+    assert calls == ["primary", "backup"]
+    assert result == {"role": "assistant", "content": "hi"}
+
+
+def test_openrouter_a_read_timeout_is_translated_to_a_clear_actionable_message(monkeypatch):
+    import requests as real_requests
+    provider = OpenRouterProvider(api_key="fake", system_prompt="BASE")
+    monkeypatch.setattr(provider._session, "post", _raise(real_requests.exceptions.ReadTimeout("Read timed out. (read timeout=60)")))
+    with pytest.raises(RuntimeError, match="OpenRouter didn't respond within 60s"):
+        provider.reply([{"role": "user", "content": "hi"}])
+
+
+def test_openrouter_a_connection_error_is_translated_clearly(monkeypatch):
+    import requests as real_requests
+    provider = OpenRouterProvider(api_key="fake", system_prompt="BASE")
+    monkeypatch.setattr(provider._session, "post", _raise(real_requests.exceptions.ConnectionError("no route to host")))
+    with pytest.raises(RuntimeError, match="Couldn't reach OpenRouter"):
         provider.reply([{"role": "user", "content": "hi"}])
 
 

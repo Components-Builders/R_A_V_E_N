@@ -7,6 +7,7 @@ in-process (a real WebSocket handshake and message loop, not a mock of the
 server itself) -- only the Assistant's own dependencies are faked.
 """
 import json
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -262,8 +263,13 @@ def real_store(tmp_path):
 
 def _ask(ws, text):
     ws.send_json({"type": "ask", "text": text})
-    reply = ws.receive_json()
-    sessions = ws.receive_json()
+    reply = _recv(ws, "reply")
+    sessions = _recv(ws, "sessions")
+    # _run_ask also sends a "stats" message after "sessions" -- drain it too,
+    # so it can never be mistaken for the next thing this connection sends
+    # (found live: it was, shifting every later ws.receive_json() in a test
+    # that calls _ask() more than once).
+    _recv(ws, "stats")
     return reply, sessions
 
 
@@ -280,7 +286,9 @@ def test_new_session_starts_an_empty_chat_and_lists_both(real_store):
     with TestClient(server.app).websocket_connect("/ws") as ws:
         _ask(ws, "first chat")
         ws.send_json({"type": "new_session"})
-        history, sessions = ws.receive_json(), ws.receive_json()
+        # new_session's own _send_history() also sends a "stats" message
+        # between "history" and "sessions" -- see _ask()'s own comment.
+        history, sessions = _recv(ws, "history"), _recv(ws, "sessions")
     assert history["type"] == "history" and history["items"] == []
     assert len(sessions["items"]) == 2 and sessions["current"] == history["session"]
     assert sessions["items"][0]["title"] == "New chat"   # the empty new one is most recent... 
@@ -289,8 +297,8 @@ def test_new_session_starts_an_empty_chat_and_lists_both(real_store):
 
 def test_new_session_while_already_empty_does_not_pile_up_empty_chats(real_store):
     with TestClient(server.app).websocket_connect("/ws") as ws:
-        ws.send_json({"type": "new_session"}); ws.receive_json(); first = ws.receive_json()
-        ws.send_json({"type": "new_session"}); ws.receive_json(); second = ws.receive_json()
+        ws.send_json({"type": "new_session"}); _recv(ws, "history"); first = _recv(ws, "sessions")
+        ws.send_json({"type": "new_session"}); _recv(ws, "history"); second = _recv(ws, "sessions")
     assert len(first["items"]) == len(second["items"]) == 1
 
 
@@ -298,10 +306,10 @@ def test_open_session_switches_history_and_keeps_chats_separate(real_store):
     with TestClient(server.app).websocket_connect("/ws") as ws:
         _, s1 = _ask(ws, "alpha topic")
         alpha = s1["current"]
-        ws.send_json({"type": "new_session"}); ws.receive_json(); ws.receive_json()
+        ws.send_json({"type": "new_session"}); _recv(ws, "history"); _recv(ws, "sessions")
         _ask(ws, "beta topic")
         ws.send_json({"type": "open_session", "id": alpha})
-        history, sessions = ws.receive_json(), ws.receive_json()
+        history, sessions = _recv(ws, "history"), _recv(ws, "sessions")
     assert [i["text"] for i in history["items"]] == ["alpha topic", "ok"]
     assert sessions["current"] == alpha
 
@@ -310,7 +318,7 @@ def test_the_assistant_after_switching_only_sees_that_chats_history(real_store):
     store, MockProvider = real_store
     with TestClient(server.app).websocket_connect("/ws") as ws:
         _, s1 = _ask(ws, "alpha topic")
-        ws.send_json({"type": "new_session"}); ws.receive_json(); ws.receive_json()
+        ws.send_json({"type": "new_session"}); _recv(ws, "history"); _recv(ws, "sessions")
         _ask(ws, "beta topic")
     sent = [m.get("content") for m in MockProvider.return_value.reply.call_args[0][0]]
     assert "beta topic" in sent and "alpha topic" not in sent
@@ -320,11 +328,11 @@ def test_delete_session_removes_it_and_falls_back_to_another(real_store):
     with TestClient(server.app).websocket_connect("/ws") as ws:
         _, s1 = _ask(ws, "alpha topic")
         alpha = s1["current"]
-        ws.send_json({"type": "new_session"}); ws.receive_json(); ws.receive_json()
+        ws.send_json({"type": "new_session"}); _recv(ws, "history"); _recv(ws, "sessions")
         _, s2 = _ask(ws, "beta topic")
         beta = s2["current"]
         ws.send_json({"type": "delete_session", "id": beta})
-        history, sessions = ws.receive_json(), ws.receive_json()
+        history, sessions = _recv(ws, "history"), _recv(ws, "sessions")
     assert [x["id"] for x in sessions["items"]] == [alpha]
     assert sessions["current"] == alpha and [i["text"] for i in history["items"]] == ["alpha topic", "ok"]
 
@@ -333,7 +341,7 @@ def test_deleting_the_only_session_leaves_a_fresh_empty_one(real_store):
     with TestClient(server.app).websocket_connect("/ws") as ws:
         _, s1 = _ask(ws, "only chat")
         ws.send_json({"type": "delete_session", "id": s1["current"]})
-        history, sessions = ws.receive_json(), ws.receive_json()
+        history, sessions = _recv(ws, "history"), _recv(ws, "sessions")
     assert history["items"] == [] and len(sessions["items"]) == 1 and sessions["items"][0]["title"] == "New chat"
 
 
@@ -637,3 +645,143 @@ def test_set_model_a_bad_api_key_leaves_the_current_model_untouched():
             msg = _recv(ws, "error")
     assert "NVIDIA_API_KEY" in msg["message"]
     mock_save.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Cancelling an in-flight "ask" (desktop UI): cancel_ask -> cancel_requested
+# (immediate ack) -> "cancelled" (once the underlying, uninterruptible call
+# actually finishes). A real Store is used so the history-rollback can be
+# checked for real, not just inferred from a mock.
+# ---------------------------------------------------------------------------
+
+def test_cancel_ask_with_nothing_in_flight_is_a_clear_error():
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "cancel_ask"})
+            msg = _recv(ws, "error")
+    assert "Nothing to cancel" in msg["message"]
+
+
+def test_cancel_ask_acknowledges_immediately_then_reports_cancelled_when_settled(real_store):
+    store, MockProvider = real_store
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_reply(messages, tools=None):
+        started.set()
+        release.wait(timeout=5)
+        return {"role": "assistant", "content": "too late"}
+
+    MockProvider.return_value.reply.side_effect = slow_reply
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        ws.send_json({"type": "ask", "text": "slow one"})
+        assert started.wait(timeout=5)  # the call is genuinely in flight now
+        ws.send_json({"type": "cancel_ask"})
+        ack = _recv(ws, "cancel_requested")
+        release.set()  # let the "uninterruptible" call finish
+        settled = _recv(ws, "cancelled")
+    assert ack == {"type": "cancel_requested"}
+    assert settled == {"type": "cancelled"}
+    # Known, documented limitation (see _run_ask's own comment): Assistant.ask()
+    # already persisted this turn to the store before _run_ask learned it was
+    # cancelled, so it's genuinely still on disk. The live conversation
+    # (self.assistant.history, what the model/UI actually see for the rest of
+    # this session) is what must be clean -- checked more strongly by
+    # test_cancel_ask_rolls_back_the_turn_from_live_history below.
+    assert any(m.get("content") == "too late" for m in store.load())
+
+
+def test_cancel_ask_rolls_back_the_turn_from_live_history(real_store):
+    """Stronger check than the message-level one above: the exact user
+    message and reply from the cancelled turn must be gone from
+    self.assistant.history (what get_history/the model both read), not just
+    absent from the "cancelled" response."""
+    store, MockProvider = real_store
+    release = threading.Event()
+    MockProvider.return_value.reply.side_effect = lambda messages, tools=None: (
+        release.wait(timeout=5),
+        {"role": "assistant", "content": "should be discarded"},
+    )[1]
+
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        ws.send_json({"type": "ask", "text": "please cancel me"})
+        ws.send_json({"type": "cancel_ask"})
+        _recv(ws, "cancel_requested")
+        release.set()
+        _recv(ws, "cancelled")
+
+        ws.send_json({"type": "get_history"})
+        history = _recv(ws, "history")
+    texts = [i["text"] for i in history["items"]]
+    assert "please cancel me" not in texts
+    assert "should be discarded" not in texts
+
+
+def test_a_new_ask_is_refused_while_one_is_in_flight(real_store):
+    store, MockProvider = real_store
+    release = threading.Event()
+    MockProvider.return_value.reply.side_effect = lambda messages, tools=None: (
+        release.wait(timeout=5),
+        {"role": "assistant", "content": "first"},
+    )[1]
+
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        ws.send_json({"type": "ask", "text": "first one"})
+        ws.send_json({"type": "ask", "text": "second one"})
+        msg = _recv(ws, "error")
+        release.set()
+        _recv(ws, "reply")
+    assert "Wait for the current request" in msg["message"]
+
+
+def test_a_new_ask_is_allowed_immediately_after_a_cancelled_one_settles(real_store):
+    """The refusal above must not become permanent -- once a cancelled ask's
+    background call actually finishes, a fresh one must go through normally."""
+    store, MockProvider = real_store
+    release = threading.Event()
+    calls = []
+
+    def flaky(messages, tools=None):
+        calls.append(1)
+        if len(calls) == 1:
+            release.wait(timeout=5)
+            return {"role": "assistant", "content": "first (discarded)"}
+        return {"role": "assistant", "content": "second, real reply"}
+
+    MockProvider.return_value.reply.side_effect = flaky
+
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        ws.send_json({"type": "ask", "text": "first"})
+        ws.send_json({"type": "cancel_ask"})
+        _recv(ws, "cancel_requested")
+        release.set()
+        _recv(ws, "cancelled")
+
+        ws.send_json({"type": "ask", "text": "second"})
+        reply = _recv(ws, "reply")
+    assert reply == {"type": "reply", "text": "second, real reply"}
+
+
+def test_cancelling_a_call_that_then_fails_reports_cancelled_not_an_error(real_store):
+    """A cancelled call that ALSO errors out (e.g. the network request fails
+    after the user gave up on it) must still read as a cancellation to the
+    user, not a scary unrelated error."""
+    store, MockProvider = real_store
+    release = threading.Event()
+
+    def failing(messages, tools=None):
+        release.wait(timeout=5)
+        raise RuntimeError("network blew up after the user stopped waiting")
+
+    MockProvider.return_value.reply.side_effect = failing
+
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        ws.send_json({"type": "ask", "text": "doomed"})
+        ws.send_json({"type": "cancel_ask"})
+        _recv(ws, "cancel_requested")
+        release.set()
+        settled = _recv(ws, "cancelled")
+    assert settled == {"type": "cancelled"}

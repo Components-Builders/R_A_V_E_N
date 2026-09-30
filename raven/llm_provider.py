@@ -7,6 +7,25 @@ import requests
 
 from raven.config import NOTES_PATH
 
+def _request_call(service: str, fn):
+    """Run `fn()` (a self._session.post(...) call), translating requests'
+    own connection-level exceptions into a clear, actionable RuntimeError --
+    same treatment NvidiaProvider._post already gives a raw 404. Without this,
+    a stalled request surfaced as the literal `requests`/urllib3 exception
+    text verbatim in the UI's error banner (found live: "HTTPSConnectionPool
+    (host='integrate.api.nvidia.com', port=443): Read timed out. (read
+    timeout=60)"), which tells a user nothing about what to actually do."""
+    try:
+        return fn()
+    except requests.exceptions.Timeout as e:
+        raise RuntimeError(
+            f"{service} didn't respond within 60s -- the model may be slow, overloaded, or "
+            f"too large for the free tier. Try again, or pick a different/smaller model."
+        ) from e
+    except requests.exceptions.ConnectionError as e:
+        raise RuntimeError(f"Couldn't reach {service}: {e}") from e
+
+
 RULES_MAX_CHARS = 4000  # same convention as tools.MAX_OUTPUT_CHARS — a rules
                          # file is meant to be a short guide, not a haystack,
                          # and it's added to EVERY request, so an unbounded
@@ -294,7 +313,7 @@ class OpenRouterProvider(LLMProvider):
         """Shared by reply() and reply_with_image() -- the actual HTTP call,
         error handling, and token/model bookkeeping, so the two don't drift
         out of sync on retry/timeout/error behavior."""
-        response = self._session.post(
+        response = _request_call("OpenRouter", lambda: self._session.post(
             url="https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -304,7 +323,7 @@ class OpenRouterProvider(LLMProvider):
             json=payload,
             timeout=60,  # requests has no default timeout — without this, a stalled free-tier
                          # backend hangs the request indefinitely instead of failing visibly.
-        )
+        ))
         if not response.ok:
             raise RuntimeError(f"OpenRouter {response.status_code}: {response.text}")
         data = response.json()
@@ -383,12 +402,12 @@ class NvidiaProvider(LLMProvider):
         raise last_error if last_error else RuntimeError("No model candidates configured.")
 
     def _post(self, payload: dict) -> dict:
-        response = self._session.post(
+        response = _request_call("NVIDIA", lambda: self._session.post(
             url=f"{NVIDIA_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
             json=payload,
             timeout=60,  # same "requests has no default timeout" guard as OpenRouterProvider._post
-        )
+        ))
         if not response.ok:
             # Found live (2026-09-28): /v1/models (list_nvidia_models) lists NVIDIA's
             # whole catalog, but a listed model isn't necessarily INVOKABLE with a

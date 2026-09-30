@@ -1,5 +1,6 @@
 """CLI entry point for R.A.V.E.N."""
 import argparse
+import getpass
 
 from pathlib import Path
 
@@ -444,6 +445,26 @@ def confirm_run(action: str, status: Status | None = None) -> bool:
             status.start()
 
 
+def sudo_password_prompt(status: Status | None = None) -> str | None:
+    """tools.py's sudo password provider (interactive CLI only -- see
+    tools.set_sudo_password_provider's own docstring for why the desktop
+    server never registers one of these). Masked input via getpass (never
+    echoed to the terminal, never logged); pressing Enter/Ctrl+C/Ctrl+D
+    declines, same "no answer means no" posture confirm_run already has.
+    Same spinner-pause dance as confirm_run, for the same reason: a Status
+    spinner's Live render would otherwise paint over this prompt."""
+    if status is not None:
+        status.stop()
+    try:
+        password = getpass.getpass("  R.A.V.E.N needs your sudo password to continue: ")
+    except (EOFError, KeyboardInterrupt):
+        password = ""
+    finally:
+        if status is not None:
+            status.start()
+    return password or None
+
+
 class SlashCompleter(Completer):
     """Suggests slash commands, dimmed, when the input starts with '/'."""
 
@@ -610,6 +631,10 @@ def main():
         return
 
     assistant, provider = build_assistant(confirm_run)
+    # Interactive only -- run_headless() never calls this, so a sudo command
+    # there still just fails cleanly with no cached credential, same as
+    # before (no TTY to safely prompt on, and -p/--yes must stay scriptable).
+    tools.set_sudo_password_provider(sudo_password_prompt)
 
     def bottom_toolbar():
         thoughts = "expanded" if UI_STATE["show_thoughts"] else "collapsed"
@@ -676,6 +701,7 @@ def main():
 
             assistant.on_tool_call = on_tool_call
             assistant.confirm_run = lambda action: confirm_run(action, status)
+            tools.set_sudo_password_provider(lambda: sudo_password_prompt(status))
             thought_ok = True
             try:
                 reply = assistant.ask(user_input)

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, session } from 'electron';
+import { app, BrowserWindow, clipboard, ipcMain, session } from 'electron';
 import path from 'node:path';
 import started from 'electron-squirrel-startup';
 import { startServer, stopServer } from './serverProcess';
@@ -44,10 +44,20 @@ app.on('ready', () => {
   // Push-to-talk (VoiceStage.tsx) calls getUserMedia({audio:true}) from the
   // renderer. Electron denies permission requests it hasn't been told about,
   // so without this the mic prompt would never resolve at all -- only our
-  // own window ever asks, so granting 'media' outright is safe here.
+  // own window ever asks, so granting 'media'/clipboard outright is safe here.
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-    callback(permission === 'media');
+    callback(permission === 'media' || permission === 'clipboard-read' || permission === 'clipboard-sanitized-write');
   });
+  // Copy/paste (MessageBubble.tsx): routed through the MAIN process rather
+  // than calling electron's `clipboard` module directly from preload --
+  // preload's own copy of `require('electron')` isn't guaranteed to expose
+  // every native module the same way the main process's always does (this
+  // is what broke it originally: calling it from preload threw "Cannot read
+  // properties of undefined" reaching for `clipboard` inside the bridged
+  // function, even though the outer bridge object itself looked fine). The
+  // main process's `clipboard` import here is never sandboxed/restricted.
+  ipcMain.handle('clipboard:writeText', (_event, text: string) => clipboard.writeText(text));
+  ipcMain.handle('clipboard:readText', () => clipboard.readText());
   void startServer(); // the UI reconnects on its own, so no need to wait for it
   createWindow();
 });
