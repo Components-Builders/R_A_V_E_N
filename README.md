@@ -35,6 +35,23 @@ Two providers work today:
 | Fallback models | one request, OpenRouter tries each in order | tried client-side, one HTTP call per candidate |
 | Picking a model | type an id into `settings.json` | listable from a key (desktop app) or typed manually |
 
+### Finding a model your NVIDIA key can actually use
+
+NVIDIA's catalog lists what *exists*, not what your account is entitled to
+*call* — most listed ids answer a real request with
+`404 Function '<uuid>': Not found for account`, and a few that do answer turn
+out not to support tool calling, which R.A.V.E.N needs on nearly every turn.
+There is no way to tell from the listing alone, so:
+
+```bash
+python scripts/probe_nvidia_models.py            # nemotron models
+python scripts/probe_nvidia_models.py --all      # the whole catalog (slow)
+```
+
+It makes one real chat request per candidate, reports which ones answer,
+which of those support tools, and how fast each is warm — then prints a
+ready-to-paste `settings.json` snippet for the fastest usable one.
+
 Switch providers by editing `~/.raven/settings.json`:
 
 ```json
